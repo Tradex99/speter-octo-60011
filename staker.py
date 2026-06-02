@@ -105,7 +105,7 @@ class Staker:
         cookies    = parse_cookie_string(cookie_str)
 
         self._playwright = await async_playwright().start()
-        browser = await self._playwright.firefox.launch(headless=True)
+        browser = await self._playwright.firefox.launch(headless=False)
         self._context = await browser.new_context(
             user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
             viewport={"width": 1504, "height": 900},
