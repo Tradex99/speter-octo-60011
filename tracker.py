@@ -94,8 +94,8 @@ async def fetch_live_events(headers):
         return response
 
 
-def filter_halftime_matches(tournaments, min_seconds=2520, max_seconds=2700):
-    # 2520 = 42:00,  2700 = 45:00
+def filter_halftime_matches(tournaments, min_seconds=2400, max_seconds=2700):
+    # 2520 = 40:00,  2700 = 45:00
     total_matches = 0
     qualifying    = []
 
