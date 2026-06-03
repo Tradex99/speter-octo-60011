@@ -18,7 +18,7 @@ HT_DC_LEAD_GAP = {
     (30, 35): 1,
 }
 
-MIN_ODD     = 1.10
+MIN_ODD     = 1.02
 MAX_SIGNALS = 3
 
 BETKING_HEADERS = {
