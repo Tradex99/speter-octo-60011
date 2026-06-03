@@ -1,17 +1,37 @@
+import httpx
 import asyncio
 import os
-from playwright.async_api import async_playwright
-from supabase import create_client
-
-PHONE     = "9120183273"
-PASSWORD  = "Edmond99"
-LOGIN_URL = "https://www.sportybet.com/ng/login/"
+from datetime import datetime, timezone
+from urllib.parse import quote
 
 
-def load_db_config(filepath="db.txt"):
+#Config
+LOGIN_URL = "https://m.betking.com/islands/_actions/login/"
+USERNAME  = "09120183273"
+PASSWORD  = "Edmond99@"
+
+LOGIN_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "Accept":          "application/json",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://m.betking.com/en-ng",
+    "Origin":          "https://m.betking.com",
+    "Dnt":             "1",
+    "Sec-Gpc":         "1",
+    "Sec-Fetch-Dest":  "empty",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Site":  "same-origin",
+    "Priority":        "u=0",
+    "Te":              "trailers",
+    "Cookie":          "ABTestHomePrematchNewApi=true; ABTestHomePrematchBoostedNewApi=true",
+}
+
+
+def _load_db_config():
+    base   = os.path.dirname(os.path.abspath(__file__))
     config = {}
-    base = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(base, filepath), "r") as f:
+    with open(os.path.join(base, "db.txt"), "r") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -22,105 +42,99 @@ def load_db_config(filepath="db.txt"):
     return config
 
 
-def save_cookie_to_db(cookie_str: str):
-    config = load_db_config("db.txt")
-    supabase = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-    supabase.table("sportybet").update({"cookie": cookie_str}).eq("id", 1).execute()
-    print("cookie saved to DB")
+def _get_supabase():
+    from supabase import create_client
+    config = _load_db_config()
+    return create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
 
 
-async def run_login():
-    async with async_playwright() as p:
-        browser = await p.firefox.launch(headless=True)
+def _build_cookie(access_token: str, refresh_token: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
+                f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    ts_encoded = quote(timestamp, safe="")
 
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) "
-                "Gecko/20100101 Firefox/140.0"
-            ),
-            locale="en-US",
-            timezone_id="Africa/Lagos",
-            viewport={"width": 1280, "height": 800},
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Sec-GPC":         "1",
-            },
+    return (
+        "ABTestHomePrematchNewApi=true; "
+        "ABTestHomePrematchBoostedNewApi=true; "
+        f"accessToken={access_token}; "
+        f"lastLoginTimeStamp={ts_encoded}; "
+        f"refreshToken={refresh_token}; "
+        "ABTestPrematchToLiveTransition=true; "
+        "ABTestCrossSellRollout=true; "
+        "ABTestNewBuildCoupon=false; "
+        "ABTestMybetSettlementAwareRollout=C"
+    )
+
+
+async def login() -> bool:
+    print("[login] sending login request ...")
+
+    boundary = "----geckoformboundary837ee54a32476e6e6acfdfd4198332af"
+
+    fields = [
+        ("username",         USERNAME),
+        ("password",         PASSWORD),
+        ("anonymousId",      ""),
+        ("locale",           "en-ng"),
+        ("discriminationId", "19010103"),
+        ("loginSource",      "login_button"),
+        ("usernameType",     "text"),
+    ]
+
+    body_parts = []
+    for name, value in fields:
+        body_parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
         )
+    body_parts.append(f"--{boundary}--\r\n")
+    body = "".join(body_parts).encode()
 
-        page = await context.new_page()
+    headers = {
+        **LOGIN_HEADERS,
+        "Content-Type":   f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(len(body)),
+    }
 
-        print("opening login page")
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
+        resp = await client.post(LOGIN_URL, headers=headers, content=body)
 
-        # Wait for phone input
-        try:
-            await page.wait_for_selector('input[name="phone"]', timeout=15000)
-        except Exception:
-            print("login page did not load")
-            await browser.close()
-            return False
+    if resp.status_code != 200:
+        print(f"[login] failed     : HTTP {resp.status_code}")
+        return False
 
-        print("filling credentials")
-        await page.fill('input[name="phone"]', PHONE)
-        await asyncio.sleep(0.3)
-        await page.fill('input[placeholder="Password"]', PASSWORD)
-        await asyncio.sleep(0.3)
+    try:
+        data = resp.json()
+    except Exception:
+        print(f"[login] failed     : could not parse response")
+        return False
 
-        # Track login success and cookie
-        login_ok        = asyncio.Event()
-        captured_cookie = {"value": None}
+    # Response is a JSON array, tokens are at fixed indices
+    # index 3 = accessToken, index 5 = refreshToken
+    try:
+        access_token  = data[3]
+        refresh_token = data[5]
+    except (IndexError, KeyError):
+        print(f"[login] failed     : tokens not found in response")
+        return False
 
-        async def handle_response(response):
-            if "/api/ng/patron/accessToken" in response.url and response.request.method == "POST":
-                print(f"accessToken response -> HTTP {response.status}")
-                if response.status == 200:
-                    login_ok.set()
-                else:
-                    try:
-                        body = await response.text()
-                        print(f"accessToken body -> {body[:300]}")
-                    except Exception:
-                        pass
+    if not access_token or not refresh_token:
+        print(f"[login] failed     : empty tokens in response")
+        return False
 
-        async def handle_request(request):
-            if login_ok.is_set() and captured_cookie["value"] is None:
-                cookie_header = request.headers.get("cookie") or request.headers.get("Cookie")
-                if cookie_header and "accessToken" in cookie_header:
-                    captured_cookie["value"] = cookie_header
+    cookie = _build_cookie(access_token, refresh_token)
 
-        page.on("response", handle_response)
-        page.on("request",  handle_request)
+    try:
+        sb = _get_supabase()
+        sb.table("betking").update({"cookie": cookie}).eq("id", 1).execute()
+        print(f"[login] success    : cookie saved to DB")
+    except Exception as e:
+        print(f"[login] db error   : {e}")
+        return False
 
-        # Click login
-        await page.click('.af-button--primary:has-text("Login")')
-        print("login button clicked")
-
-        # Wait for accessToken response
-        try:
-            await asyncio.wait_for(login_ok.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            print("login failed — no 200 from accessToken endpoint")
-            await browser.close()
-            return False
-
-        print("login successful")
-
-        # Wait for a request with the full cookie
-        for _ in range(30):
-            if captured_cookie["value"]:
-                break
-            await asyncio.sleep(0.5)
-
-        if not captured_cookie["value"]:
-            print("could not capture cookie from requests")
-            await browser.close()
-            return False
-
-        save_cookie_to_db(captured_cookie["value"])
-        await browser.close()
-        return True
+    return True
 
 
 if __name__ == "__main__":
-    asyncio.run(run_login())
+    asyncio.run(login())

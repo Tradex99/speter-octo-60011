@@ -1,213 +1,141 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import httpx
 import time
 import asyncio
-from collections import deque
-from supabase import create_client
 from module.analyzer import analyze, reset_signal_count
 from staker import Staker
 
 
-def load_db_config(filepath="db.txt"):
-    config = {}
-    base = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(base, filepath), "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                key, _, value = line.partition("=")
-                config[key.strip()] = value.strip().strip('"')
-    return config
+#Config
+TIME_WINDOWS = [
+    (25, 30),
+    (30, 35),
+]
+
+INTERVAL = 50
+
+BETKING_URL = (
+    "https://sportsapicdn-desktop.betking.com"
+    "/api/feeds/live/areaOddsByLayout/en/1/3/0/false/false/true/true"
+)
+
+BETKING_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Origin":          "https://www.betking.com",
+    "Referer":         "https://www.betking.com/",
+    "Sec-Fetch-Dest":  "empty",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Site":  "same-site",
+    "Sec-Gpc":         "1",
+    "Priority":        "u=6",
+    "Cache-Control":   "max-age=0",
+    "Te":              "trailers",
+}
 
 
-def get_cookie_from_db():
-    config = load_db_config("db.txt")
-    supabase = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-
-    result = (
-        supabase.table("sportybet")
-        .select("cookie")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-
-    if not result.data:
-        raise Exception("No cookie found in database.")
-
-    return parse_cookie_string(result.data[0]["cookie"])
+def in_time_window(match_time):
+    for lo, hi in TIME_WINDOWS:
+        if lo <= match_time <= hi:
+            return True
+    return False
 
 
-def parse_cookie_string(cookie_str):
-    cookies = {}
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, _, value = part.partition("=")
-            cookies[name.strip()] = value.strip()
-    return cookies
+def get_window_label(match_time):
+    for lo, hi in TIME_WINDOWS:
+        if lo <= match_time <= hi:
+            return f"{lo}-{hi}'"
+    return "?"
 
 
-def parse_played_seconds(played_str):
-    try:
-        parts = played_str.split(":")
-        return (int(parts[0]) * 60) + int(parts[1])
-    except:
-        return 0
-
-
-def build_headers(cookies):
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    return {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-        "Accept": "*/*",
-        "Accept-Language": "en",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://www.sportybet.com/ng/sport/football/live_list/",
-        "Clientid": "web",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Operid": "2",
-        "Platform": "web",
-        "Sporty-Referer": "utm_source=https://www.google.com/",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "same-origin",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-GPC": "1",
-        "Priority": "u=4",
-        "Te": "trailers",
-        "Cookie": cookie_header,
-    }
-
-
-async def fetch_live_events(headers):
-    timestamp = int(time.time() * 1000)
-    url = "https://www.sportybet.com/api/ng/factsCenter/liveOrPrematchEvents"
-    params = {"sportId": "sr:sport:1", "_t": timestamp}
-
-    async with httpx.AsyncClient(http2=True, timeout=15.0, headers=headers) as client:
-        response = await client.get(url, params=params)
-        return response
-
-
-def filter_halftime_matches(tournaments, min_seconds=2400, max_seconds=2700):
-    # 2520 = 40:00,  2700 = 45:00
-    total_matches = 0
-    qualifying    = []
-
-    for tournament in tournaments:
-        tournament_name = tournament.get("name", "")
-
-        if "SRL" in tournament_name:
-            total_matches += len(tournament.get("events", []))
-            continue
-
-        for event in tournament.get("events", []):
-            total_matches += 1
-            played_str  = event.get("playedSeconds", "0:00")
-            played_secs = parse_played_seconds(played_str)
-
-            if min_seconds <= played_secs <= max_seconds:
-                qualifying.append({
-                    "eventId":    event.get("eventId", "N/A"),
-                    "match":      f"{event.get('homeTeamName','?')} vs {event.get('awayTeamName','?')}",
-                    "score":      event.get("setScore", "?"),
-                    "played":     played_str,
-                    "status":     event.get("matchStatus", "?"),
-                    "tournament": tournament_name,
-                })
-
-    return total_matches, qualifying
-
-
-async def run_once(staker: Staker, headers: dict, cycle: int, seen: deque):
-    start = time.time()
-
-    response = await fetch_live_events(headers)
-    elapsed  = time.time() - start
-
+async def fetch_live_events():
+    async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
+        response = await client.get(BETKING_URL, headers=BETKING_HEADERS)
     if response.status_code != 200:
-        print(f"[cycle {cycle}] request failed: {response.status_code}")
+        print(f"[tracker] fetch failed: HTTP {response.status_code}")
+        return None
+    return response.json()
+
+
+def filter_qualifying_matches(data):
+    total    = 0
+    matching = []
+    for sport in data.get("Sports", []):
+        if sport.get("Id") != 1:
+            continue
+        for tournament in sport.get("Tournaments", []):
+            for event in tournament.get("Events", []):
+                total += 1
+                match_time = event.get("MatchTime", -1)
+                if not in_time_window(match_time):
+                    continue
+                matching.append({
+                    "id":         event["Id"],
+                    "name":       event.get("Name", "?"),
+                    "score":      event.get("Score", "?"),
+                    "match_time": match_time,
+                    "window":     get_window_label(match_time),
+                    "tournament": tournament.get("Name", "?"),
+                })
+    return total, matching
+
+
+async def run_once(cycle, staker):
+    start   = time.time()
+    data    = await fetch_live_events()
+    elapsed = time.time() - start
+
+    if data is None:
         return
 
-    data        = response.json()
-    tournaments = data.get("data", [])
-    total_matches, qualifying = filter_halftime_matches(tournaments)
+    total, qualifying = filter_qualifying_matches(data)
 
-    new_matches = [m for m in qualifying if m["eventId"] not in seen]
-    skipped     = len(qualifying) - len(new_matches)
-
-    print(f"\n[cycle {cycle}] Total live: {total_matches} | 42–45 mins: {len(qualifying)} | new: {len(new_matches)} | skipped: {skipped} | fetch: {elapsed:.2f}s")
+    print(f"\n[cycle {cycle}] Total live: {total} | qualifying: {len(qualifying)} | fetch: {elapsed:.2f}s")
     print("-" * 50)
 
-    if not new_matches:
-        print(f"[cycle {cycle}] No new qualifying matches.")
+    if not qualifying:
+        print(f"[cycle {cycle}] No qualifying matches.")
         return
 
-    for m in new_matches:
-        print(f"  eventId    : {m['eventId']}")
-        print(f"  Match      : {m['match']}")
+    for m in qualifying:
+        print(f"  eventId    : {m['id']}")
+        print(f"  Match      : {m['name']}")
         print(f"  Score      : {m['score']}")
-        print(f"  Played     : {m['played']}")
+        print(f"  MatchTime  : {m['match_time']}' ({m['window']})")
         print(f"  Tournament : {m['tournament']}")
         print("  " + "-" * 48)
 
-        seen.append(m["eventId"])
-        if len(seen) > 15:
-            seen.popleft()
-
     reset_signal_count()
 
-    analyzer_tasks = [
+    await asyncio.gather(*[
         asyncio.create_task(
-            analyze(event_id=m["eventId"], headers=headers, staker=staker)
+            analyze(event_id=m["id"], match_time=m["match_time"], staker=staker)
         )
-        for m in new_matches
-    ]
-
-    await asyncio.gather(*analyzer_tasks)
+        for m in qualifying
+    ])
 
     if not staker._queue.empty():
         await staker._queue.join()
 
 
 async def main_async():
-    INTERVAL = 50  # seconds between each cycle
-
-    loop    = asyncio.get_event_loop()
-    cookies = await loop.run_in_executor(None, get_cookie_from_db)
-    headers = build_headers(cookies)
-
-    staker = Staker()
-    await staker.start()
+    staker      = Staker()
     staker_task = asyncio.create_task(staker.run())
-
-    seen  = deque()
-    cycle = 1
+    cycle       = 1
 
     try:
         while True:
-            await run_once(staker, headers, cycle, seen)
+            await run_once(cycle, staker)
             cycle += 1
             print(f"\n[tracker] next cycle in {INTERVAL}s ...")
             await asyncio.sleep(INTERVAL)
-    except asyncio.CancelledError:
-        pass
     except KeyboardInterrupt:
         print("\n[tracker] stopped by user")
     finally:
         staker_task.cancel()
-        await staker.stop()
         print("[tracker] shutdown complete")
 
 
-def main():
-    asyncio.run(main_async())
-
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
