@@ -22,7 +22,6 @@ BETKING_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
     "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
     "Origin":          "https://www.betking.com",
     "Referer":         "https://www.betking.com/",
     "Sec-Fetch-Dest":  "empty",
