@@ -1,16 +1,36 @@
 import httpx
-import time
-import os
-from datetime import datetime
-from supabase import create_client
-
-MAX_OPEN_BETS = 12  # stop staking if open bets >= this
+import asyncio
+from datetime import datetime, timezone
 
 
-def load_db_config(filepath="db.txt"):
+#Config
+MAX_OPEN_BETS  = 5
+TRACKER_NAME   = "chukwuebuka"
+
+OPEN_URL     = "https://m.betking.com/en-ng/my-bets/sports/open?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
+SETTLED_URL  = "https://m.betking.com/en-ng/my-bets/sports/settled?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
+
+MYBETS_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "Accept":          "*/*",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Dnt":             "1",
+    "Sec-Gpc":         "1",
+    "Sec-Fetch-Dest":  "empty",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Site":  "same-origin",
+    "Priority":        "u=0",
+    "Te":              "trailers",
+}
+
+
+def _get_supabase():
+    import os
+    from supabase import create_client
+    base   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config = {}
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(base, filepath), "r") as f:
+    with open(os.path.join(base, "db.txt"), "r") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -18,165 +38,152 @@ def load_db_config(filepath="db.txt"):
             if "=" in line:
                 key, _, value = line.partition("=")
                 config[key.strip()] = value.strip().strip('"')
-    return config
+    return create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
 
 
-def get_cookie_from_db() -> str:
-    config = load_db_config("db.txt")
-    supabase = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-    result = (
-        supabase.table("sportybet")
-        .select("cookie")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if not result.data:
-        raise Exception("No cookie found in database.")
-    return result.data[0]["cookie"]
+def _get_cookie():
+    sb  = _get_supabase()
+    row = sb.table("betking").select("cookie").eq("id", 1).single().execute()
+    return row.data["cookie"]
 
 
-def parse_cookie_string(cookie_str: str) -> dict:
-    cookies = {}
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, _, value = part.partition("=")
-            cookies[name.strip()] = value.strip()
-    return cookies
+def _today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def build_headers(cookie_str: str) -> dict:
-    return {
-        "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-        "Accept":          "*/*",
-        "Accept-Language": "en",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer":         "https://www.sportybet.com/ng/my_accounts/bet_history/sport_bets?isSettled=10",
-        "Clientid":        "web",
-        "Content-Type":    "application/x-www-form-urlencoded; charset=UTF-8",
-        "Operid":          "2",
-        "Platform":        "web",
-        "Sec-Fetch-Dest":  "empty",
-        "Sec-Fetch-Mode":  "same-origin",
-        "Sec-Fetch-Site":  "same-origin",
-        "Sec-GPC":         "1",
-        "Priority":        "u=4",
-        "Te":              "trailers",
-        "Cookie":          cookie_str,
-    }
+async def _fetch_open(headers: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(http2=True, timeout=15.0, follow_redirects=False) as client:
+            resp = await client.get(
+                OPEN_URL,
+                headers={**headers, "Referer": "https://m.betking.com/en-ng/my-bets/sports/settled"},
+            )
+            if resp.status_code in (401, 301):
+                return {"error": str(resp.status_code)}
+            if not resp.text or not resp.text.strip():
+                return {"error": "session_expired"}
+            data = resp.json()
+            return data if isinstance(data, dict) else {"error": "session_expired"}
+    except Exception as e:
+        return {"error": f"exception:{e}"}
 
 
-def get_today_str() -> str:
-    now = datetime.now()
-    return f"{now.day}/{now.month}/{now.year}"
+async def _fetch_settled(headers: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(http2=True, timeout=15.0, follow_redirects=False) as client:
+            resp = await client.get(
+                SETTLED_URL,
+                headers={**headers, "Referer": "https://m.betking.com/en-ng/my-bets/sports/open"},
+            )
+            if resp.status_code in (401, 301):
+                return {"error": str(resp.status_code)}
+            if not resp.text or not resp.text.strip():
+                return {"error": "session_expired"}
+            data = resp.json()
+            return data if isinstance(data, dict) else {"error": "session_expired"}
+    except Exception as e:
+        return {"error": f"exception:{e}"}
 
 
-def is_today(create_time_ms: int) -> bool:
-    dt  = datetime.fromtimestamp(create_time_ms / 1000)
-    now = datetime.now()
-    return dt.year == now.year and dt.month == now.month and dt.day == now.day
+def _count_open(data: dict) -> int:
+    coupons = data.get("couponsData", {}).get("coupons", [])
+    return sum(1 for c in coupons if c.get("couponCode"))
 
 
-def get_today_tracker_row() -> dict | None:
-    config   = load_db_config("db.txt")
-    supabase = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-    result   = (
-        supabase.table("sp_tracker")
-        .select("id, played, max, win, lost")
-        .eq("day", get_today_str())
-        .execute()
-    )
-    return result.data[0] if result.data else None
+def _parse_settled_today(data: dict) -> tuple[int, int]:
+    today   = _today_str()
+    coupons = data.get("couponsData", {}).get("coupons", [])
+    wins    = 0
+    losses  = 0
+    for c in coupons:
+        settled = c.get("settledDate", "")
+        if not settled.startswith(today):
+            continue
+        state = c.get("betFinalState")
+        if state in (1, 5):
+            wins += 1
+        elif state == 3 or c.get("won", 0) == 0:
+            losses += 1
+    return wins, losses
 
 
-def update_win_loss(won: int, lost: int):
-    config   = load_db_config("db.txt")
-    supabase = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-    today    = get_today_str()
+def _update_tracker(wins: int, losses: int, played: int):
+    today = _today_str()
+    # format to match existing day column e.g. "2/6/2026"
+    d, m, y = today.split("-")[2], today.split("-")[1], today.split("-")[0]
+    day_str  = f"{int(d)}/{int(m)}/{y}"
 
-    result = (
-        supabase.table("sp_tracker")
-        .select("id")
-        .eq("day", today)
-        .execute()
-    )
-    if not result.data:
-        print("[betlist] no sp_tracker row for today — skipping win/loss update")
-        return
+    sb  = _get_supabase()
+    row = sb.table("sp_tracker").select("*").eq("name", TRACKER_NAME).execute()
 
-    supabase.table("sp_tracker").update({
-        "win":  won,
-        "lost": lost,
-    }).eq("id", result.data[0]["id"]).execute()
-
-    print(f"[betlist] win/loss updated -> W:{won} L:{lost}")
-
-
-def check_can_bet() -> bool:
-    """
-    Returns True if staker should proceed, False if it should stop.
-    Checks (in order):
-      1. Daily played limit reached (sp_tracker)
-      2. Open bets limit reached
-    Also syncs today's win/loss counts into sp_tracker.
-    """
-
-    # --- Check 1: daily stake limit ---
-    row = get_today_tracker_row()
-    if row:
-        played = row.get("played", 0)
-        max_bets = row.get("max", 50)
-        print(f"[betlist] daily played -> {played}/{max_bets}")
-        if played >= max_bets:
-            print(f"[betlist] daily limit reached ({played}/{max_bets}) — stopping")
-            return False
+    if row.data:
+        sb.table("sp_tracker").update({
+            "win":    wins,
+            "lost":   losses,
+            "played": played,
+            "day":    day_str,
+        }).eq("name", TRACKER_NAME).execute()
     else:
-        print("[betlist] no sp_tracker row for today — daily limit not checked")
+        sb.table("sp_tracker").insert({
+            "name":   TRACKER_NAME,
+            "max":    50,
+            "played": played,
+            "win":    wins,
+            "lost":   losses,
+            "day":    day_str,
+        }).execute()
 
-    # --- Check 2: open bets + win/loss sync ---
-    cookie_str = get_cookie_from_db()
-    headers    = build_headers(cookie_str)
-    timestamp  = int(time.time() * 1000)
 
-    url = "https://www.sportybet.com/api/ng/orders/order/v2/realbetlist"
-    params = {
-        "isSettled": 10,
-        "pageSize":  50,
-        "pageNo":    1,
-        "_t":        timestamp,
-    }
-
-    response = httpx.get(url, headers=headers, params=params, timeout=10.0)
-
-    if response.status_code == 401:
-        print("[betlist] session expired (401) — re-logging in")
-        import subprocess, sys
-        subprocess.run([sys.executable, os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "login.py"
-        )])
+async def check_can_bet() -> bool:
+    """
+    Returns True if betting is allowed, False if blocked.
+    Fires open + settled requests in parallel, updates sp_tracker.
+    """
+    try:
+        cookie  = _get_cookie()
+    except Exception as e:
+        print(f"[betlist] cookie err : {e}")
         return False
 
-    if response.status_code != 200:
-        print(f"[betlist] request failed -> HTTP {response.status_code}")
+    headers = {**MYBETS_HEADERS, "Cookie": cookie}
+
+    print(f"[betlist] checking   : open bets + settled")
+
+    open_task, settled_task = await asyncio.gather(
+        _fetch_open(headers),
+        _fetch_settled(headers),
+    )
+
+    open_err    = open_task.get("error")
+    settled_err = settled_task.get("error")
+
+    if open_err or settled_err:
+        err = open_err or settled_err
+        if err in ("401", "301", "session_expired"):
+            print(f"[betlist] session    : expired - attempting re-login")
+            import sys, os
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from login import login
+            await login()
+        else:
+            print(f"[betlist] fetch err  : {err}")
         return False
 
-    data        = response.json().get("data", {})
-    bets        = data.get("entityList", [])
-    todays_bets = [b for b in bets if is_today(b.get("createTime", 0))]
+    open_count      = _count_open(open_task)
+    wins, losses    = _parse_settled_today(settled_task)
+    played          = wins + losses
 
-    open_bets  = [b for b in todays_bets if b.get("winningStatus") == 0]
-    won_bets   = [b for b in todays_bets if b.get("winningStatus") == 20]
-    lost_bets  = [b for b in todays_bets if b.get("winningStatus") == 30]
-    open_count = len(open_bets)
+    print(f"[betlist] open bets  : {open_count} / {MAX_OPEN_BETS}")
+    print(f"[betlist] today      : played={played} | win={wins} | lost={losses}")
 
-    print(f"[betlist] today -> open:{open_count}  won:{len(won_bets)}  lost:{len(lost_bets)}")
-
-    update_win_loss(len(won_bets), len(lost_bets))
+    try:
+        _update_tracker(wins, losses, played)
+        print(f"[betlist] tracker    : updated")
+    except Exception as e:
+        print(f"[betlist] tracker err: {e}")
 
     if open_count >= MAX_OPEN_BETS:
-        print(f"[betlist] open bets limit reached ({open_count}/{MAX_OPEN_BETS}) — skipping")
+        print(f"[betlist] blocked    : max open bets reached ({open_count})")
         return False
 
-    print(f"[betlist] clear ({open_count}/{MAX_OPEN_BETS}) — proceeding")
     return True
