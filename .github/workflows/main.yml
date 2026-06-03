@@ -22,15 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Playwright Firefox
-        run: playwright install firefox --with-deps
-
       - name: Run tracker.py
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
-          DISPLAY: ":99"
-        run: |
-          Xvfb :99 -screen 0 1504x900x24 &
-          sleep 1
-          timeout 355m python3 -u tracker.py || true
+        run: timeout 355m python3 -u tracker.py || true
