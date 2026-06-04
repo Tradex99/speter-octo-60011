@@ -57,6 +57,17 @@ async def fetch_live_events():
     return response.json()
 
 
+def _is_simulated(event_name: str, tournament_name: str) -> bool:
+    if "simulated" in tournament_name.lower():
+        return True
+    parts = event_name.split(" - ")
+    if len(parts) == 2:
+        home, away = parts
+        if home.strip().upper().endswith("SRL") and away.strip().upper().endswith("SRL"):
+            return True
+    return False
+
+
 def filter_qualifying_matches(data):
     total    = 0
     matching = []
@@ -66,6 +77,8 @@ def filter_qualifying_matches(data):
         for tournament in sport.get("Tournaments", []):
             for event in tournament.get("Events", []):
                 total += 1
+                if _is_simulated(event.get("Name", ""), tournament.get("Name", "")):
+                    continue
                 match_time = event.get("MatchTime", -1)
                 if not in_time_window(match_time):
                     continue
