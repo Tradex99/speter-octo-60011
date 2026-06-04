@@ -7,12 +7,12 @@ import asyncio
 HT_TOTAL_TYPE_ID = 161
 HT_DC_TYPE_ID    = 9588
 
+# Primary: 1st Half Under — only active in 25-30 window with 3 goal gap
 TIME_WINDOW_GAP = {
     (25, 30): 3,
-    (30, 40): 2,
 }
 
-# HT DC: minimum goal lead required per window to qualify
+# HT DC lead required per window
 HT_DC_LEAD_GAP = {
     (25, 30): 2,
     (30, 35): 1,
@@ -60,8 +60,6 @@ def _parse_score(score_str):
         return None
 
 
-# --- Primary: 1st Half Under ---
-
 def _find_ht_total_market(markets, target_line):
     target_str = str(target_line)
     for market in markets:
@@ -90,8 +88,6 @@ def _get_under_selection(market):
     return None, "under selection not found"
 
 
-# --- Fallback: HT DC ---
-
 def _find_ht_dc_market(markets):
     for market in markets:
         if market.get("TypeId") == HT_DC_TYPE_ID:
@@ -100,11 +96,6 @@ def _find_ht_dc_market(markets):
 
 
 def _get_dc_selection(market, home_goals, away_goals):
-    """
-    If home is winning -> 1X (home team can't lose)
-    If away is winning -> X2 (away team can't lose)
-    Draw -> no signal (no lead, DC doesn't apply)
-    """
     if home_goals > away_goals:
         target_name = "1X"
     elif away_goals > home_goals:
@@ -146,20 +137,24 @@ def extract_event(data):
         return None
 
 
-async def analyze(event_id, match_time, staker=None):
+async def analyze(event_id, match_time) -> dict | None:
+    """
+    Analyze a single match. Returns a bet payload dict if signal found, else None.
+    Does NOT interact with staker directly — caller collects and batches.
+    """
     global _signal_count
 
     async with _signal_lock:
         if _signal_count >= MAX_SIGNALS:
-            return
+            return None
 
     raw = await fetch_event(event_id)
     if raw is None:
-        return
+        return None
 
     event = extract_event(raw)
     if event is None:
-        return
+        return None
 
     match_name    = event.get("Name", "?")
     score_str     = event.get("Score", "")
@@ -175,7 +170,7 @@ async def analyze(event_id, match_time, staker=None):
     parsed = _parse_score(score_str)
     if parsed is None:
         print(f"[analyzer] {match_name} - bad score '{score_str}'")
-        return
+        return None
 
     home_goals, away_goals = parsed
     total_goals = home_goals + away_goals
@@ -189,7 +184,7 @@ async def analyze(event_id, match_time, staker=None):
     chosen_odd    = None
     special_value = ""
 
-    # --- Primary: 1st Half Under ---
+    # Primary: 1st Half Under (25-30 only)
     under_gap = _get_window_gap(match_time, TIME_WINDOW_GAP)
     if under_gap is not None:
         target_line   = float(total_goals + under_gap) - 0.5
@@ -208,7 +203,7 @@ async def analyze(event_id, match_time, staker=None):
             else:
                 print(f"[analyzer] primary   : {reason}")
 
-    # --- Fallback: HT DC ---
+    # Fallback: HT DC
     if chosen_sel is None:
         dc_gap = _get_window_gap(match_time, HT_DC_LEAD_GAP)
         if dc_gap is None:
@@ -235,21 +230,18 @@ async def analyze(event_id, match_time, staker=None):
     if chosen_sel is None:
         print(f"[analyzer] no signal : {match_name}")
         print()
-        return
+        return None
 
     async with _signal_lock:
         if _signal_count >= MAX_SIGNALS:
             print()
-            return
+            return None
         _signal_count += 1
 
     print(f"[analyzer] signal    : {match_name} | {chosen_label} @ {chosen_odd}")
     print()
 
-    if staker is None:
-        return
-
-    await staker.queue({
+    return {
         "eventId":              event_id,
         "matchId":              event_id,
         "parentEventId":        event_id,
@@ -274,5 +266,4 @@ async def analyze(event_id, match_time, staker=None):
         "targetLine":           chosen_label,
         "homeTeam":             home_team,
         "awayTeam":             away_team,
-        "requestTransactionId": str(random.randint(10_000_000_000, 99_999_999_999)),
-    })
+    }

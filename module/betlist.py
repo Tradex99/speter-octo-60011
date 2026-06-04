@@ -4,11 +4,12 @@ from datetime import datetime, timezone
 
 
 #Config
-MAX_OPEN_BETS  = 5
-TRACKER_NAME   = "chukwuebuka"
+MAX_OPEN_BETS = 5
+MAX_PLAYED    = 20
+TRACKER_NAME  = "chukwuebuka"
 
-OPEN_URL     = "https://m.betking.com/en-ng/my-bets/sports/open?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
-SETTLED_URL  = "https://m.betking.com/en-ng/my-bets/sports/settled?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
+OPEN_URL    = "https://m.betking.com/en-ng/my-bets/sports/open?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
+SETTLED_URL = "https://m.betking.com/en-ng/my-bets/sports/settled?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
 
 MYBETS_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
@@ -48,6 +49,12 @@ def _get_cookie():
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _day_label() -> str:
+    today = _today_str()
+    y, m, d = today.split("-")
+    return f"{int(d)}/{int(m)}/{y}"
 
 
 async def _fetch_open(headers: dict) -> dict:
@@ -90,42 +97,79 @@ def _count_open(data: dict) -> int:
 
 
 def _parse_settled_today(data: dict) -> tuple[int, int]:
+    """
+    Parse today's settled bets, deduplicating by selectionId set.
+    5 tickets of same match = 1 win or 1 loss.
+    Returns (wins, losses) as unique match counts.
+    """
     today   = _today_str()
     coupons = data.get("couponsData", {}).get("coupons", [])
-    wins    = 0
-    losses  = 0
+
+    # Group by frozenset of selectionIds — same set = same match/bet
+    seen_keys = {}   # key -> betFinalState (first seen wins)
     for c in coupons:
         settled = c.get("settledDate", "")
         if not settled.startswith(today):
             continue
-        state = c.get("betFinalState")
+        sel_key = frozenset(
+            s["selectionId"] for s in c.get("selectionResults", [])
+        )
+        if not sel_key:
+            continue
+        # Only record first occurrence — all tickets for same match share same state
+        if sel_key not in seen_keys:
+            seen_keys[sel_key] = c.get("betFinalState")
+
+    wins   = 0
+    losses = 0
+    for state in seen_keys.values():
         if state in (1, 5):
             wins += 1
-        elif state == 3 or c.get("won", 0) == 0:
+        elif state == 3:
             losses += 1
+
     return wins, losses
 
 
-def _update_tracker(wins: int, losses: int, played: int):
-    today = _today_str()
-    # format to match existing day column e.g. "2/6/2026"
-    d, m, y = today.split("-")[2], today.split("-")[1], today.split("-")[0]
-    day_str  = f"{int(d)}/{int(m)}/{y}"
+def _update_tracker(wins: int, losses: int, api_played: int):
+    """
+    Update sp_tracker using increment logic:
+    - wins and losses come from API (deduplicated) — these are always the source of truth
+    - played = wins + losses (derived, always accurate)
+    - max is capped at MAX_PLAYED (20)
+    - If the row is from a previous day, reset it fresh for today
+    """
+    today   = _today_str()
+    day_str = _day_label()
+    played  = wins + losses
 
     sb  = _get_supabase()
     row = sb.table("sp_tracker").select("*").eq("name", TRACKER_NAME).execute()
 
     if row.data:
-        sb.table("sp_tracker").update({
-            "win":    wins,
-            "lost":   losses,
-            "played": played,
-            "day":    day_str,
-        }).eq("name", TRACKER_NAME).execute()
+        existing = row.data[0]
+        # If existing row is from a previous day, reset everything
+        if existing.get("day") != day_str:
+            sb.table("sp_tracker").update({
+                "win":    wins,
+                "lost":   losses,
+                "played": played,
+                "max":    MAX_PLAYED,
+                "day":    day_str,
+            }).eq("name", TRACKER_NAME).execute()
+        else:
+            # Same day — wins/losses from API are deduplicated source of truth
+            # played is always wins + losses
+            sb.table("sp_tracker").update({
+                "win":    wins,
+                "lost":   losses,
+                "played": played,
+                "max":    MAX_PLAYED,
+            }).eq("name", TRACKER_NAME).execute()
     else:
         sb.table("sp_tracker").insert({
             "name":   TRACKER_NAME,
-            "max":    50,
+            "max":    MAX_PLAYED,
             "played": played,
             "win":    wins,
             "lost":   losses,
@@ -139,7 +183,7 @@ async def check_can_bet() -> bool:
     Fires open + settled requests in parallel, updates sp_tracker.
     """
     try:
-        cookie  = _get_cookie()
+        cookie = _get_cookie()
     except Exception as e:
         print(f"[betlist] cookie err : {e}")
         return False
@@ -168,12 +212,12 @@ async def check_can_bet() -> bool:
             print(f"[betlist] fetch err  : {err}")
         return False
 
-    open_count      = _count_open(open_task)
-    wins, losses    = _parse_settled_today(settled_task)
-    played          = wins + losses
+    open_count   = _count_open(open_task)
+    wins, losses = _parse_settled_today(settled_task)
+    played       = wins + losses
 
     print(f"[betlist] open bets  : {open_count} / {MAX_OPEN_BETS}")
-    print(f"[betlist] today      : played={played} | win={wins} | lost={losses}")
+    print(f"[betlist] today      : played={played} | win={wins} | lost={losses} | max={MAX_PLAYED}")
 
     try:
         _update_tracker(wins, losses, played)
@@ -185,4 +229,33 @@ async def check_can_bet() -> bool:
         print(f"[betlist] blocked    : max open bets reached ({open_count})")
         return False
 
+    if played >= MAX_PLAYED:
+        print(f"[betlist] blocked    : daily max played reached ({played}/{MAX_PLAYED})")
+        return False
+
     return True
+
+
+async def increment_played():
+    """
+    Called by staker immediately after a successful bet placement.
+    Increments the played count in DB by 1 without waiting for API sync.
+    This ensures accurate count between betlist cycles.
+    """
+    try:
+        today   = _today_str()
+        day_str = _day_label()
+        sb      = _get_supabase()
+        row     = sb.table("sp_tracker").select("*").eq("name", TRACKER_NAME).execute()
+
+        if row.data:
+            existing = row.data[0]
+            if existing.get("day") == day_str:
+                current = existing.get("played", 0)
+                sb.table("sp_tracker").update({
+                    "played": current + 1,
+                }).eq("name", TRACKER_NAME).execute()
+            # If different day, don't increment — betlist full sync will fix it
+        # If no row yet, also skip — betlist full sync will create it
+    except Exception as e:
+        print(f"[betlist] increment err: {e}")
