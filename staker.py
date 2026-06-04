@@ -53,14 +53,67 @@ def get_cookie():
     return row.data["cookie"]
 
 
-def _build_coupon(p):
-    odd   = p["oddValue"]
-    stake = STAKE_AMOUNT
-    win   = round(stake * odd, 2)
+def _build_odds_entry(p):
+    return {
+        "IDSelectionType":    p["selectionTypeId"],
+        "IDSport":            1,
+        "allowFixed":         True,
+        "compatibilityLevel": 0,
+        "eventCategory":      "L",
+        "eventId":            p["categoryId"],
+        "eventName":          p["categoryName"],
+        "fixed":              False,
+        "gamePlay":           1,
+        "incompatibleEvents": [],
+        "isExpired":          False,
+        "isLocked":           False,
+        "isBetBuilder":       False,
+        "marketId":           p["marketId"],
+        "marketName":         p["marketName"],
+        "marketTag":          0,
+        "marketTypeId":       p["marketTypeId"],
+        "matchId":            p["matchId"],
+        "matchName":          p["matchName"],
+        "oddValue":           p["oddValue"],
+        "parentEventId":      p["parentEventId"],
+        "selectionId":        p["selectionId"],
+        "selectionName":      p["selectionName"],
+        "smartCode":          0,
+        "specialValue":       p["specialValue"],
+        "sportName":          "Football",
+        "tournamentId":       p["tournamentId"],
+        "tournamentName":     p["tournamentName"],
+        "selectionKMId":      p["selectionKMId"],
+        "matchKMId":          p["matchKMId"],
+        "marketKMId":         p["marketKMId"],
+        "isTransitioned":     False,
+    }
 
-    grouping_block = {
-        "grouping":           1,
-        "combinations":       1,
+
+def _zero_grouping(grouping, combinations):
+    return {
+        "grouping":           grouping,
+        "combinations":       combinations,
+        "minWin":             0,
+        "minWinNet":          0,
+        "netStakeMinWin":     0,
+        "maxWin":             0,
+        "maxWinNet":          0,
+        "netStakeMaxWin":     0,
+        "minBonus":           0,
+        "maxBonus":           0,
+        "minPercentageBonus": 0,
+        "maxPercentageBonus": 0,
+        "stake":              -1,
+        "netStake":           -1,
+        "selected":           False,
+    }
+
+
+def _win_grouping(grouping, combinations, win, stake):
+    return {
+        "grouping":           grouping,
+        "combinations":       combinations,
         "minWin":             win,
         "minWinNet":          win,
         "netStakeMinWin":     win,
@@ -76,10 +129,43 @@ def _build_coupon(p):
         "selected":           True,
     }
 
+
+def _build_coupon(payloads, tx_id):
+    """
+    Build betCoupon for 1, 2, or 3 selections.
+    payloads: list of bet payload dicts
+    """
+    from math import prod
+    n     = len(payloads)
+    stake = STAKE_AMOUNT
+
+    total_odds = round(prod(p["oddValue"] for p in payloads), 10)
+    win        = round(stake * total_odds, 2)
+
+    # couponTypeId: 1 = single, 2 = multiple
+    coupon_type = 1 if n == 1 else 2
+
+    # For single: one grouping at level 1 selected
+    # For multi:  lower groupings unselected, top grouping (=n) selected
+    from math import comb as ncomb
+    if n == 1:
+        groupings      = [_win_grouping(1, 1, win, stake)]
+        all_groupings  = [_win_grouping(1, 1, win, stake)]
+        possible_miss  = []
+    else:
+        groupings     = [_win_grouping(n, 1, win, stake)]
+        all_groupings = [_zero_grouping(k, ncomb(n, k)) for k in range(1, n)]
+        all_groupings.append(_win_grouping(n, 1, win, stake))
+        possible_miss = [{"grouping": k, "combinations": ncomb(n, k)} for k in range(1, n)]
+
+    bet_type = "Singles" if n == 1 else "Multiple"
+    # trackingData category: "football" if all same sport, "mixed" otherwise
+    category = "football"
+
     return {
         "betCoupon": {
             "isClientSideCoupon":  True,
-            "couponTypeId":        1,
+            "couponTypeId":        coupon_type,
             "minWin":              win,
             "minWinNet":           win,
             "netStakeMinWin":      win,
@@ -90,9 +176,9 @@ def _build_coupon(p):
             "maxBonus":            0,
             "minPercentageBonus":  0,
             "maxPercentageBonus":  0,
-            "minOdd":              odd,
-            "maxOdd":              odd,
-            "totalOdds":           odd,
+            "minOdd":              round(total_odds, 2),
+            "maxOdd":              round(total_odds, 2),
+            "totalOdds":           total_odds,
             "stake":               stake,
             "useGroupsStake":      False,
             "stakeGross":          stake,
@@ -103,46 +189,13 @@ def _build_coupon(p):
             "maxWithholdingTax":   0,
             "turnoverTax":         0,
             "totalCombinations":   1,
-            "odds": [{
-                "IDSelectionType":    p["selectionTypeId"],
-                "IDSport":            1,
-                "allowFixed":         True,
-                "compatibilityLevel": 0,
-                "eventCategory":      "L",
-                "eventId":            p["categoryId"],
-                "eventName":          p["categoryName"],
-                "fixed":              False,
-                "gamePlay":           1,
-                "incompatibleEvents": [],
-                "isExpired":          False,
-                "isLocked":           False,
-                "isBetBuilder":       False,
-                "marketId":           p["marketId"],
-                "marketName":         p["marketName"],
-                "marketTag":          0,
-                "marketTypeId":       p["marketTypeId"],
-                "matchId":            p["matchId"],
-                "matchName":          p["matchName"],
-                "oddValue":           odd,
-                "parentEventId":      p["parentEventId"],
-                "selectionId":        p["selectionId"],
-                "selectionName":      p["selectionName"],
-                "smartCode":          0,
-                "specialValue":       p["specialValue"],
-                "sportName":          "Football",
-                "tournamentId":       p["tournamentId"],
-                "tournamentName":     p["tournamentName"],
-                "selectionKMId":      p["selectionKMId"],
-                "matchKMId":          p["matchKMId"],
-                "marketKMId":         p["marketKMId"],
-                "isTransitioned":     False,
-            }],
-            "groupings":               [grouping_block],
-            "possibleMissingGroupings": [],
-            "currencyId":              -1,
-            "isLive":                  True,
-            "isVirtual":               False,
-            "currentEvalMotivation":   0,
+            "odds":                [_build_odds_entry(p) for p in payloads],
+            "groupings":           groupings,
+            "possibleMissingGroupings": possible_miss,
+            "currencyId":          -1,
+            "isLive":              True,
+            "isVirtual":           False,
+            "currentEvalMotivation": 0,
             "betCouponGlobalVariable": {
                 "currencyId":                -1,
                 "defaultStakeGross":         100,
@@ -176,26 +229,26 @@ def _build_coupon(p):
             },
             "language":     "en",
             "hasLive":      True,
-            "couponType":   1,
-            "allGroupings": [grouping_block],
+            "couponType":   coupon_type,
+            "allGroupings": all_groupings,
         },
         "allowOddChanges":        True,
         "allowStakeReduction":    False,
-        "requestTransactionId":   p["requestTransactionId"],
+        "requestTransactionId":   tx_id,
         "transferStakeFromAgent": False,
         "trackingData": {
-            "category":          "football",
+            "category":          category,
             "product":           "sportsbook-live",
             "is_reuse_bet":      False,
             "reused_selections": 0,
             "origin_bet_status": None,
-            "bet_type":          "Singles",
+            "bet_type":          bet_type,
         },
     }
 
 
-def _build_body(p):
-    coupon = _build_coupon(p)
+def _build_body(payloads, tx_id):
+    coupon = _build_coupon(payloads, tx_id)
     adjust = {"adjustId": "", "adjustIdfa": "", "gpsAdId": ""}
     return urlencode({
         "data":      json.dumps(coupon, separators=(",", ":")),
@@ -208,33 +261,42 @@ class Staker:
         self._queue     = asyncio.Queue()
         self._bet_cache = deque(maxlen=20)  # event_ids of successfully placed bets
 
-    async def queue(self, payload):
-        await self._queue.put(payload)
+    async def queue(self, payloads: list, tx_id: str):
+        """Queue a batch of 1-3 payloads to be staked together."""
+        await self._queue.put((payloads, tx_id))
 
     async def run(self):
         while True:
-            payload = await self._queue.get()
+            item = await self._queue.get()
             try:
-                await self._place_bet(payload)
+                payloads, tx_id = item
+                await self._place_bet(payloads, tx_id)
             except Exception as e:
                 print(f"[staker] error      : {e}")
             finally:
                 self._queue.task_done()
 
-    async def _place_bet(self, p):
-        match   = p["matchName"]
-        line    = p["targetLine"]
-        odd     = p["oddValue"]
-        score   = p["score"]
-        minutes = p["matchTime"]
+    async def _place_bet(self, payloads: list, tx_id: str):
+        n = len(payloads)
 
-        event_id = p["eventId"]
-        if event_id in self._bet_cache:
-            print(f"[staker] cached     : {match} already bet, skipping")
+        # Filter out already-cached event_ids
+        fresh = [p for p in payloads if p["eventId"] not in self._bet_cache]
+        if not fresh:
+            print(f"[staker] cached     : all {n} selections already bet, skipping")
             return
+        if len(fresh) < n:
+            skipped = n - len(fresh)
+            print(f"[staker] cached     : {skipped} selection(s) already bet, continuing with {len(fresh)}")
+            payloads = fresh
+            n = len(fresh)
 
-        print(f"[staker] placing    : {match}")
-        print(f"[staker] bet        : {score} {minutes}' | {line} @ {odd}")
+        bet_type = "Single" if n == 1 else f"Multi x{n}"
+        names    = " + ".join(p["matchName"] for p in payloads)
+        lines    = " + ".join(str(p["targetLine"]) for p in payloads)
+        odds_str = " x ".join(str(p["oddValue"]) for p in payloads)
+
+        print(f"[staker] placing    : [{bet_type}] {names}")
+        print(f"[staker] bet        : {lines} | odds: {odds_str}")
 
         from module.betlist import check_can_bet
         allowed = await check_can_bet()
@@ -248,45 +310,64 @@ class Staker:
             print(f"[staker] cookie err : {e}")
             return
 
-        headers = {**PLACEBET_HEADERS, "Cookie": cookie}
-        body    = _build_body(p)
+        headers     = {**PLACEBET_HEADERS, "Cookie": cookie}
+        tickets     = 5
+        placed      = 0
+        any_session_error = False
 
-        async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-            resp = await client.put(PLACEBET_URL, headers=headers, content=body.encode())
+        for ticket_num in range(1, tickets + 1):
+            import random
+            ticket_tx_id = str(random.randint(10_000_000_000, 99_999_999_999))
+            body         = _build_body(payloads, ticket_tx_id)
 
-        if resp.status_code in (401, 301):
-            print(f"[staker] session    : expired ({resp.status_code}) - attempting re-login")
+            try:
+                async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
+                    resp = await client.put(PLACEBET_URL, headers=headers, content=body.encode())
+            except Exception as e:
+                print(f"[staker] ticket {ticket_num}  : request error - {e}")
+                continue
+
+            if resp.status_code in (401, 301):
+                print(f"[staker] ticket {ticket_num}  : expired ({resp.status_code}) - re-login")
+                any_session_error = True
+                break
+
+            if resp.status_code != 200:
+                print(f"[staker] ticket {ticket_num}  : HTTP {resp.status_code}")
+                continue
+
+            if not resp.text or not resp.text.strip():
+                print(f"[staker] ticket {ticket_num}  : expired (empty body) - re-login")
+                any_session_error = True
+                break
+
+            try:
+                data        = resp.json()
+                coupon_code = data.get("couponCode")
+                status      = data.get("responseStatus")
+            except Exception:
+                print(f"[staker] ticket {ticket_num}  : could not parse response")
+                continue
+
+            if coupon_code:
+                placed += 1
+                print(f"[staker] ticket {ticket_num}  : placed | coupon: {coupon_code}")
+                from module.betlist import increment_played
+                await increment_played()
+            else:
+                errors = data.get("errorsList", {})
+                print(f"[staker] ticket {ticket_num}  : rejected | status={status} | errors={errors}")
+
+        if any_session_error:
             import sys, os
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             from login import login
             await login()
-            return
 
-        if resp.status_code != 200:
-            print(f"[staker] failed     : HTTP {resp.status_code}")
-            return
-
-        if not resp.text or not resp.text.strip():
-            print(f"[staker] session    : expired (empty body) - attempting re-login")
-            import sys, os
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from login import login
-            await login()
-            return
-
-        try:
-            data        = resp.json()
-            coupon_code = data.get("couponCode")
-            status      = data.get("responseStatus")
-        except Exception:
-            print(f"[staker] failed     : could not parse response")
-            return
-
-        if coupon_code:
-            self._bet_cache.append(event_id)
-            print(f"[staker] placed     : {match} | {line} @ {odd}")
-            print(f"[staker] coupon     : {coupon_code}")
+        if placed > 0:
+            for p in payloads:
+                self._bet_cache.append(p["eventId"])
+            print(f"[staker] summary    : {placed}/{tickets} tickets placed | {names} | {lines}")
             print(f"[staker] cache      : {len(self._bet_cache)}/20 slots used")
         else:
-            errors = data.get("errorsList", {})
-            print(f"[staker] rejected   : {match} | status={status} | errors={errors}")
+            print(f"[staker] summary    : 0/{tickets} tickets placed | {names}")

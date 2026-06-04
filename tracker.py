@@ -1,6 +1,7 @@
 import httpx
 import time
 import asyncio
+import random
 from module.analyzer import analyze, reset_signal_count
 from staker import Staker
 
@@ -120,12 +121,18 @@ async def run_once(cycle, staker):
 
     reset_signal_count()
 
-    await asyncio.gather(*[
+    results = await asyncio.gather(*[
         asyncio.create_task(
-            analyze(event_id=m["id"], match_time=m["match_time"], staker=staker)
+            analyze(event_id=m["id"], match_time=m["match_time"])
         )
         for m in qualifying
     ])
+
+    signals = [r for r in results if r is not None]
+
+    if signals:
+        tx_id = str(random.randint(10_000_000_000, 99_999_999_999))
+        await staker.queue(signals, tx_id)
 
     if not staker._queue.empty():
         await staker._queue.join()
