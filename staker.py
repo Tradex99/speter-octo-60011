@@ -1,4 +1,5 @@
 import httpx
+import random
 from collections import deque
 import asyncio
 import json
@@ -7,7 +8,7 @@ from urllib.parse import urlencode
 
 
 #Config
-STAKE_AMOUNT = 10
+STAKE_AMOUNT = 50
 
 PLACEBET_URL = (
     "https://m.betking.com/en-ng/sports/action/placebet"
@@ -310,53 +311,47 @@ class Staker:
             print(f"[staker] cookie err : {e}")
             return
 
-        headers     = {**PLACEBET_HEADERS, "Cookie": cookie}
-        tickets     = 5
-        placed      = 0
+        headers          = {**PLACEBET_HEADERS, "Cookie": cookie}
+        ticket_tx_id     = str(random.randint(10_000_000_000, 99_999_999_999))
+        body             = _build_body(payloads, ticket_tx_id)
         any_session_error = False
+        placed            = 0
 
-        for ticket_num in range(1, tickets + 1):
-            import random
-            ticket_tx_id = str(random.randint(10_000_000_000, 99_999_999_999))
-            body         = _build_body(payloads, ticket_tx_id)
+        try:
+            async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
+                resp = await client.put(PLACEBET_URL, headers=headers, content=body.encode())
+        except Exception as e:
+            print(f"[staker] request err : {e}")
+            return
 
-            try:
-                async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
-                    resp = await client.put(PLACEBET_URL, headers=headers, content=body.encode())
-            except Exception as e:
-                print(f"[staker] ticket {ticket_num}  : request error - {e}")
-                continue
+        if resp.status_code in (401, 301):
+            print(f"[staker] session    : expired ({resp.status_code}) - re-login")
+            any_session_error = True
 
-            if resp.status_code in (401, 301):
-                print(f"[staker] ticket {ticket_num}  : expired ({resp.status_code}) - re-login")
-                any_session_error = True
-                break
+        elif resp.status_code != 200:
+            print(f"[staker] failed     : HTTP {resp.status_code}")
 
-            if resp.status_code != 200:
-                print(f"[staker] ticket {ticket_num}  : HTTP {resp.status_code}")
-                continue
+        elif not resp.text or not resp.text.strip():
+            print(f"[staker] session    : expired (empty body) - re-login")
+            any_session_error = True
 
-            if not resp.text or not resp.text.strip():
-                print(f"[staker] ticket {ticket_num}  : expired (empty body) - re-login")
-                any_session_error = True
-                break
-
+        else:
             try:
                 data        = resp.json()
                 coupon_code = data.get("couponCode")
                 status      = data.get("responseStatus")
             except Exception:
-                print(f"[staker] ticket {ticket_num}  : could not parse response")
-                continue
+                print(f"[staker] failed     : could not parse response")
+                return
 
             if coupon_code:
-                placed += 1
-                print(f"[staker] ticket {ticket_num}  : placed | coupon: {coupon_code}")
-                from module.betlist import increment_played
-                await increment_played()
+                placed = 1
+                print(f"[staker] placed     : {names} | {lines}")
+                print(f"[staker] coupon     : {coupon_code}")
+
             else:
                 errors = data.get("errorsList", {})
-                print(f"[staker] ticket {ticket_num}  : rejected | status={status} | errors={errors}")
+                print(f"[staker] rejected   : {names} | status={status} | errors={errors}")
 
         if any_session_error:
             import sys, os
@@ -367,7 +362,4 @@ class Staker:
         if placed > 0:
             for p in payloads:
                 self._bet_cache.append(p["eventId"])
-            print(f"[staker] summary    : {placed}/{tickets} tickets placed | {names} | {lines}")
             print(f"[staker] cache      : {len(self._bet_cache)}/20 slots used")
-        else:
-            print(f"[staker] summary    : 0/{tickets} tickets placed | {names}")

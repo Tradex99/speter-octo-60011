@@ -133,35 +133,40 @@ async def run_once(cycle, staker):
     if not signals:
         return
 
+    # Sort by odd descending so highest odds are considered first
+    signals.sort(key=lambda s: s["oddValue"], reverse=True)
+
     print(f"[tracker] signals    : {len(signals)} found, selecting best combo")
 
-    # Find best combination of up to 3 signals whose combined odd >= MIN
     from itertools import combinations as iter_combos
     from math import prod
 
-    best_batch = None
-    best_odds  = 0.0
+    best_batch   = None
+    best_combined = 0.0
 
-    # Try combos of 3, then 2, then 1 — pick highest combined odd that passes
+    # Try largest combos first (3 → 2 → 1), pick highest combined odd that passes min
     for size in (3, 2, 1):
         if len(signals) < size:
             continue
         min_odd = MIN_MULTI_ODD if size > 1 else MIN_SINGLE_ODD
         for combo in iter_combos(signals, size):
             combined = round(prod(s["oddValue"] for s in combo), 10)
-            if combined >= min_odd and combined > best_odds:
-                best_odds  = combined
-                best_batch = list(combo)
-        if best_batch:
-            break  # found best at this size, stop
+            if combined >= min_odd and combined > best_combined:
+                best_combined = combined
+                best_batch    = sorted(list(combo), key=lambda s: s["oddValue"], reverse=True)
+        # Only move to smaller size if nothing qualifies at this size
+        if best_batch is not None:
+            break
 
     if best_batch is None:
-        print(f"[tracker] skipped    : no combo meets min odd ({MIN_SINGLE_ODD}/{MIN_MULTI_ODD})")
+        odds_list = [s["oddValue"] for s in signals]
+        print(f"[tracker] skipped    : no combo meets min odd | signals={odds_list}")
         return
 
-    n = len(best_batch)
+    n        = len(best_batch)
     bet_type = "Single" if n == 1 else f"Multi x{n}"
-    print(f"[tracker] selected   : [{bet_type}] combined odd={best_odds}")
+    odds_str = " x ".join(str(s["oddValue"]) for s in best_batch)
+    print(f"[tracker] selected   : [{bet_type}] odds={odds_str} combined={best_combined}")
 
     tx_id = str(random.randint(10_000_000_000, 99_999_999_999))
     await staker.queue(best_batch, tx_id)
