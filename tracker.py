@@ -2,7 +2,7 @@ import httpx
 import time
 import asyncio
 import random
-from module.analyzer import analyze, reset_signal_count
+from module.analyzer import analyze
 from staker import Staker
 
 
@@ -12,7 +12,9 @@ TIME_WINDOWS = [
     (30, 35),
 ]
 
-INTERVAL = 50
+INTERVAL        = 50
+MIN_SINGLE_ODD  = 1.10   # single bet minimum odd
+MIN_MULTI_ODD   = 1.10   # multi bet minimum combined odd
 
 BETKING_URL = (
     "https://sportsapicdn-desktop.betking.com"
@@ -119,8 +121,6 @@ async def run_once(cycle, staker):
         print(f"  Tournament : {m['tournament']}")
         print("  " + "-" * 48)
 
-    reset_signal_count()
-
     results = await asyncio.gather(*[
         asyncio.create_task(
             analyze(event_id=m["id"], match_time=m["match_time"])
@@ -130,9 +130,41 @@ async def run_once(cycle, staker):
 
     signals = [r for r in results if r is not None]
 
-    if signals:
-        tx_id = str(random.randint(10_000_000_000, 99_999_999_999))
-        await staker.queue(signals, tx_id)
+    if not signals:
+        return
+
+    print(f"[tracker] signals    : {len(signals)} found, selecting best combo")
+
+    # Find best combination of up to 3 signals whose combined odd >= MIN
+    from itertools import combinations as iter_combos
+    from math import prod
+
+    best_batch = None
+    best_odds  = 0.0
+
+    # Try combos of 3, then 2, then 1 — pick highest combined odd that passes
+    for size in (3, 2, 1):
+        if len(signals) < size:
+            continue
+        min_odd = MIN_MULTI_ODD if size > 1 else MIN_SINGLE_ODD
+        for combo in iter_combos(signals, size):
+            combined = round(prod(s["oddValue"] for s in combo), 10)
+            if combined >= min_odd and combined > best_odds:
+                best_odds  = combined
+                best_batch = list(combo)
+        if best_batch:
+            break  # found best at this size, stop
+
+    if best_batch is None:
+        print(f"[tracker] skipped    : no combo meets min odd ({MIN_SINGLE_ODD}/{MIN_MULTI_ODD})")
+        return
+
+    n = len(best_batch)
+    bet_type = "Single" if n == 1 else f"Multi x{n}"
+    print(f"[tracker] selected   : [{bet_type}] combined odd={best_odds}")
+
+    tx_id = str(random.randint(10_000_000_000, 99_999_999_999))
+    await staker.queue(best_batch, tx_id)
 
     if not staker._queue.empty():
         await staker._queue.join()
