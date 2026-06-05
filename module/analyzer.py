@@ -14,13 +14,10 @@ TIME_WINDOW_GAP = {
 
 # HT DC lead required per window
 HT_DC_LEAD_GAP = {
-    (25, 30): 2,
     (30, 35): 1,
 }
 
-MIN_ODD     = 1.10
-MAX_SIGNALS = 3
-
+MIN_ODD     = 1.01
 BETKING_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
     "Accept":          "application/json, text/plain, */*",
@@ -35,15 +32,6 @@ BETKING_HEADERS = {
     "Cache-Control":   "max-age=0",
     "Te":              "trailers",
 }
-
-_signal_count = 0
-_signal_lock  = asyncio.Lock()
-
-
-def reset_signal_count():
-    global _signal_count
-    _signal_count = 0
-
 
 def _get_window_gap(match_time, windows):
     for (lo, hi), gap in windows.items():
@@ -144,10 +132,6 @@ async def analyze(event_id, match_time) -> dict | None:
     """
     global _signal_count
 
-    async with _signal_lock:
-        if _signal_count >= MAX_SIGNALS:
-            return None
-
     raw = await fetch_event(event_id)
     if raw is None:
         return None
@@ -231,12 +215,6 @@ async def analyze(event_id, match_time) -> dict | None:
         print(f"[analyzer] no signal : {match_name}")
         print()
         return None
-
-    async with _signal_lock:
-        if _signal_count >= MAX_SIGNALS:
-            print()
-            return None
-        _signal_count += 1
 
     print(f"[analyzer] signal    : {match_name} | {chosen_label} @ {chosen_odd}")
     print()

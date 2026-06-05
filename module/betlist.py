@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 
 #Config
-MAX_OPEN_BETS = 5
+MAX_OPEN_BETS = 10
 MAX_PLAYED    = 20
 TRACKER_NAME  = "chukwuebuka"
 
