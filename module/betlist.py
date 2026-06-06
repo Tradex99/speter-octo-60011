@@ -4,9 +4,21 @@ from datetime import datetime, timezone
 
 
 #Config
-MAX_OPEN_BETS = 4
-MAX_PLAYED    = 20
-TRACKER_NAME  = "chukwuebuka"
+MAX_OPEN_BETS  = 5
+MAX_PLAYED_CAP = 20   # hard ceiling
+TRACKER_NAME   = "chukwuebuka"
+
+
+def _dynamic_max(losses: int) -> int:
+    """
+    Start at 10. First loss → 15. Two or more losses → 20 (hard cap).
+    """
+    if losses == 0:
+        return 10
+    elif losses == 1:
+        return 15
+    else:
+        return MAX_PLAYED_CAP
 
 OPEN_URL    = "https://m.betking.com/en-ng/my-bets/sports/open?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
 SETTLED_URL = "https://m.betking.com/en-ng/my-bets/sports/settled?_data=routes%2F%28%24locale%29.my-bets.sports.%24betsType"
@@ -103,14 +115,14 @@ def _get_or_create_row(sb, day_str: str) -> dict:
     if not row.data:
         sb.table("sp_tracker").insert({
             "name":    TRACKER_NAME,
-            "max":     MAX_PLAYED,
+            "max":     _dynamic_max(0),
             "played":  0,
             "win":     0,
             "lost":    0,
             "day":     day_str,
             "bet_ids": "",
         }).execute()
-        return {"win": 0, "lost": 0, "played": 0, "day": day_str, "bet_ids": ""}
+        return {"win": 0, "lost": 0, "played": 0, "day": day_str, "bet_ids": "", "max": _dynamic_max(0)}
 
     existing = row.data[0]
     if existing.get("day") != day_str:
@@ -119,11 +131,11 @@ def _get_or_create_row(sb, day_str: str) -> dict:
             "win":     0,
             "lost":    0,
             "played":  0,
-            "max":     MAX_PLAYED,
+            "max":     _dynamic_max(0),
             "day":     day_str,
             "bet_ids": "",
         }).eq("name", TRACKER_NAME).execute()
-        return {"win": 0, "lost": 0, "played": 0, "day": day_str, "bet_ids": ""}
+        return {"win": 0, "lost": 0, "played": 0, "day": day_str, "bet_ids": "", "max": _dynamic_max(0)}
 
     return existing
 
@@ -219,11 +231,13 @@ async def check_can_bet() -> bool:
             updated_ids = ",".join(filter(None, [raw_ids] + new_bet_ids))
             print(f"[betlist] new bets   : {len(new_bet_ids)} recorded")
 
+        max_today = _dynamic_max(losses)
+
         sb.table("sp_tracker").update({
             "win":     wins,
             "lost":    losses,
             "played":  played,
-            "max":     MAX_PLAYED,
+            "max":     max_today,
             "bet_ids": updated_ids,
         }).eq("name", TRACKER_NAME).execute()
 
@@ -231,19 +245,20 @@ async def check_can_bet() -> bool:
 
     except Exception as e:
         print(f"[betlist] tracker err: {e}")
-        wins   = 0
-        losses = 0
-        played = 0
+        wins      = 0
+        losses    = 0
+        played    = 0
+        max_today = _dynamic_max(0)
 
     print(f"[betlist] open bets  : {open_count} / {MAX_OPEN_BETS}")
-    print(f"[betlist] today      : played={played} | win={wins} | lost={losses} | max={MAX_PLAYED}")
+    print(f"[betlist] today      : played={played} | win={wins} | lost={losses} | max={max_today}")
 
     if open_count >= MAX_OPEN_BETS:
         print(f"[betlist] blocked    : max open bets reached ({open_count})")
         return False
 
-    if played >= MAX_PLAYED:
-        print(f"[betlist] blocked    : daily max played reached ({played}/{MAX_PLAYED})")
+    if played >= max_today:
+        print(f"[betlist] blocked    : daily max played reached ({played}/{max_today})")
         return False
 
     return True

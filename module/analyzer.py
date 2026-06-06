@@ -1,247 +1,226 @@
 import httpx
-import random
 import asyncio
 
 
 #Config
-HT_TOTAL_TYPE_ID = 161
-HT_DC_TYPE_ID    = 9588
+EVENT_URL = "https://m.betking.com/en-ng/sports/live/api/event?areaId=2&fixtureId={fixture_id}&_data=routes%2F%28%24locale%29.sports.live.api.event"
 
-# Primary: 1st Half Under — only active in 25-30 window with 3 goal gap
-TIME_WINDOW_GAP = {
-    (25, 30): 3,
-}
-
-# HT DC lead required per window
-HT_DC_LEAD_GAP = {
-    (30, 35): 1,
-}
-
-MIN_ODD     = 1.01
-BETKING_HEADERS = {
+EVENT_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-    "Accept":          "application/json, text/plain, */*",
+    "Accept":          "*/*",
     "Accept-Language": "en-US,en;q=0.5",
-    "Origin":          "https://www.betking.com",
-    "Referer":         "https://www.betking.com/",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Dnt":             "1",
+    "Sec-Gpc":         "1",
     "Sec-Fetch-Dest":  "empty",
     "Sec-Fetch-Mode":  "cors",
-    "Sec-Fetch-Site":  "same-site",
-    "Sec-Gpc":         "1",
-    "Priority":        "u=6",
-    "Cache-Control":   "max-age=0",
+    "Sec-Fetch-Site":  "same-origin",
+    "Priority":        "u=4",
     "Te":              "trailers",
 }
 
-def _get_window_gap(match_time, windows):
-    for (lo, hi), gap in windows.items():
-        if lo <= match_time <= hi:
-            return gap
-    return None
+# Market typeId for "game - total points"
+GAME_TOTAL_TYPE_ID = 10637
+TARGET_LINES       = [15.5, 16.5]   # checked in order; first qualifying wins
+TARGET_SELECTION   = "Over"
+MIN_ODD            = 1.18
+
+# Minimum loser score per set — loser must score >= 8 in each of the 3 sets
+SET_THRESHOLDS = [8, 8, 8]
 
 
-def _parse_score(score_str):
-    try:
-        h, a = score_str.strip().split(":")
-        return int(h), int(a)
-    except Exception:
-        return None
+def _build_referer(event_id: int) -> str:
+    return f"https://m.betking.com/en-ng/sports/live/{event_id}"
 
 
-def _find_ht_total_market(markets, target_line):
-    target_str = str(target_line)
-    for market in markets:
-        if market.get("TypeId") != HT_TOTAL_TYPE_ID:
+def _parse_period_scores(period_scores: str) -> list[tuple[int, int]]:
+    """Parse '6:11 - 11:9 - 11:7' into [(6,11), (11,9), (11,7)]."""
+    sets = []
+    for part in period_scores.split(" - "):
+        part = part.strip()
+        if not part or ":" not in part:
             continue
-        if str(market.get("SpecialValue", "")) != target_str:
+        try:
+            h, a = part.split(":")
+            sets.append((int(h), int(a)))
+        except ValueError:
+            continue
+    return sets
+
+
+def _sets_qualify(sets: list[tuple[int, int]]) -> bool:
+    """
+    Check first 3 sets. In each set the loser must have scored
+    at least the threshold for that set position.
+    """
+    if len(sets) < 3:
+        return False
+    for i, threshold in enumerate(SET_THRESHOLDS):
+        h, a = sets[i]
+        loser_score = min(h, a)
+        if loser_score < threshold:
+            return False
+    return True
+
+
+def _find_market(markets: list, line: float) -> dict | None:
+    """Find the game total points market with the given lineValue."""
+    for market in markets:
+        if market.get("marketTypeId") != GAME_TOTAL_TYPE_ID:
+            continue
+        if market.get("lineValue") != line:
             continue
         return market
     return None
 
 
-def _get_under_selection(market):
-    for sel in market.get("Selections", []):
-        if sel.get("Name", "").lower() != "under":
+def _get_over_selection(market: dict) -> dict | None:
+    """Return the Over selection if active and odd meets minimum."""
+    for sel in market.get("selections", []):
+        if sel.get("name") != TARGET_SELECTION:
             continue
-        odds_list = sel.get("Odds", [])
-        if not odds_list:
-            return None, "no odds data"
-        odd_obj = odds_list[0]
-        if odd_obj.get("Status") != 1:
-            return None, "market suspended"
-        value = odd_obj.get("Value", 0.0)
-        if value < MIN_ODD:
-            return None, f"odd {value} below minimum {MIN_ODD}"
-        return sel, None
-    return None, "under selection not found"
-
-
-def _find_ht_dc_market(markets):
-    for market in markets:
-        if market.get("TypeId") == HT_DC_TYPE_ID:
-            return market
+        odd = sel.get("odd", {})
+        if odd.get("statusId") != 1:
+            return None
+        if odd.get("value", 0.0) < MIN_ODD:
+            return None
+        return sel
     return None
 
 
-def _get_dc_selection(market, home_goals, away_goals):
-    if home_goals > away_goals:
-        target_name = "1X"
-    elif away_goals > home_goals:
-        target_name = "X2"
-    else:
-        return None, "draw - no lead for DC"
-
-    for sel in market.get("Selections", []):
-        if sel.get("Name") != target_name:
+def _pick_market(markets: list) -> tuple[dict, dict, float] | tuple[None, None, None]:
+    """
+    Try TARGET_LINES in order. Return (market, over_sel, line) for the
+    first line whose Over selection exists and meets MIN_ODD, else (None, None, None).
+    """
+    for line in TARGET_LINES:
+        market = _find_market(markets, line)
+        if market is None:
+            print(f"[analyzer] no market : game total {line} not found")
             continue
-        odds_list = sel.get("Odds", [])
-        if not odds_list:
-            return None, "no odds data"
-        odd_obj = odds_list[0]
-        if odd_obj.get("Status") != 1:
-            return None, f"{target_name} suspended"
-        value = odd_obj.get("Value", 0.0)
-        if value < MIN_ODD:
-            return None, f"{target_name} odd {value} below minimum {MIN_ODD}"
-        return sel, None
-
-    return None, f"{target_name} selection not found"
+        over_sel = _get_over_selection(market)
+        if over_sel is None:
+            print(f"[analyzer] no signal : Over {line} suspended or odd below {MIN_ODD}")
+            continue
+        return market, over_sel, line
+    return None, None, None
 
 
-async def fetch_event(event_id):
-    url = f"https://sportsapicdn-desktop.betking.com/api/feeds/live/{event_id}/en"
-    async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
-        resp = await client.get(url, headers=BETKING_HEADERS)
-    if resp.status_code != 200:
-        print(f"[analyzer] fetch failed {event_id}: HTTP {resp.status_code}")
-        return None
-    return resp.json()
+async def fetch_event(event_id: int) -> dict | None:
+    url = EVENT_URL.format(fixture_id=event_id)
 
-
-def extract_event(data):
     try:
-        return data["Tournaments"][0]["Events"][0]
-    except (KeyError, IndexError):
+        import os, sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from supabase import create_client
+        base   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config = {}
+        with open(os.path.join(base, "db.txt")) as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    config[k.strip()] = v.strip().strip('"')
+        sb     = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
+        cookie = sb.table("betking").select("cookie").eq("id", 1).single().execute().data["cookie"]
+    except Exception as e:
+        print(f"[analyzer] cookie err {event_id}: {e}")
+        cookie = ""
+
+    headers = {
+        **EVENT_HEADERS,
+        "Referer": _build_referer(event_id),
+        "Cookie":  cookie,
+    }
+
+    try:
+        async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            print(f"[analyzer] fetch failed {event_id}: HTTP {resp.status_code}")
+            return None
+        if not resp.text or not resp.text.strip():
+            print(f"[analyzer] fetch failed {event_id}: empty response")
+            return None
+        data = resp.json()
+        if not isinstance(data, dict) or "event" not in data:
+            print(f"[analyzer] fetch failed {event_id}: unexpected response | keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
+            return None
+        return data
+    except Exception as e:
+        print(f"[analyzer] fetch error {event_id}: {e}")
         return None
 
 
-async def analyze(event_id, match_time) -> dict | None:
-    """
-    Analyze a single match. Returns a bet payload dict if signal found, else None.
-    Does NOT interact with staker directly — caller collects and batches.
-    """
-    global _signal_count
-
+async def analyze(event_id: int, staker=None) -> None:
     raw = await fetch_event(event_id)
     if raw is None:
-        return None
+        return
 
-    event = extract_event(raw)
-    if event is None:
-        return None
+    event   = raw.get("event", {})
+    markets = raw.get("markets", [])
 
-    match_name    = event.get("Name", "?")
-    score_str     = event.get("Score", "")
-    markets       = event.get("Markets", [])
-    tournament_id = event.get("TournamentId")
-    tournament    = event.get("TournamentName", "?")
-    category_id   = event.get("CategoryId")
-    category_name = event.get("CategoryName", "")
-    teams         = event.get("Teams", [])
-    home_team     = next((t["Name"] for t in teams if t.get("ItemOrder") == 1), "Home")
-    away_team     = next((t["Name"] for t in teams if t.get("ItemOrder") == 2), "Away")
-
-    parsed = _parse_score(score_str)
-    if parsed is None:
-        print(f"[analyzer] {match_name} - bad score '{score_str}'")
-        return None
-
-    home_goals, away_goals = parsed
-    total_goals = home_goals + away_goals
+    match_name     = event.get("name", "?")
+    period_scores  = event.get("periodScores", "")
+    tournament_id  = event.get("tournamentId")
+    tournament     = event.get("tournamentName", "?")
+    category_id    = event.get("categoryId")
+    category_name  = event.get("categoryName", "")
+    event_date     = event.get("date", "")
+    match_status   = event.get("matchStatus", "")
 
     print(f"[analyzer] checking  : {match_name}")
-    print(f"[analyzer] score     : {score_str} | time: {match_time}'")
+    print(f"[analyzer] sets      : {period_scores}")
+    print(f"[analyzer] status    : {match_status}")
 
-    chosen_market = None
-    chosen_sel    = None
-    chosen_label  = None
-    chosen_odd    = None
-    special_value = ""
-
-    # Primary: 1st Half Under (25-30 only)
-    under_gap = _get_window_gap(match_time, TIME_WINDOW_GAP)
-    if under_gap is not None:
-        target_line   = float(total_goals + under_gap) - 0.5
-        special_value = str(target_line)
-        print(f"[analyzer] primary   : Under {target_line} (gap={under_gap})")
-        market = _find_ht_total_market(markets, target_line)
-        if market is None:
-            print(f"[analyzer] primary   : no market for Under {target_line}")
-        else:
-            under_sel, reason = _get_under_selection(market)
-            if under_sel is not None:
-                chosen_market = market
-                chosen_sel    = under_sel
-                chosen_label  = f"Under {target_line}"
-                chosen_odd    = under_sel["Odds"][0]["Value"]
-            else:
-                print(f"[analyzer] primary   : {reason}")
-
-    # Fallback: HT DC
-    if chosen_sel is None:
-        dc_gap = _get_window_gap(match_time, HT_DC_LEAD_GAP)
-        if dc_gap is None:
-            print(f"[analyzer] fallback  : time {match_time}' not in DC window")
-        else:
-            lead = abs(home_goals - away_goals)
-            if lead < dc_gap:
-                print(f"[analyzer] fallback  : lead {lead} below required {dc_gap} for DC")
-            else:
-                dc_market = _find_ht_dc_market(markets)
-                if dc_market is None:
-                    print(f"[analyzer] fallback  : HT DC market not found")
-                else:
-                    dc_sel, reason = _get_dc_selection(dc_market, home_goals, away_goals)
-                    if dc_sel is not None:
-                        chosen_market = dc_market
-                        chosen_sel    = dc_sel
-                        chosen_label  = dc_sel["Name"]
-                        chosen_odd    = dc_sel["Odds"][0]["Value"]
-                        special_value = ""
-                    else:
-                        print(f"[analyzer] fallback  : {reason}")
-
-    if chosen_sel is None:
-        print(f"[analyzer] no signal : {match_name}")
+    sets = _parse_period_scores(period_scores)
+    if not _sets_qualify(sets):
+        details = " | ".join(
+            f"set{i+1}: {h}:{a} (loser={min(h,a)}>={SET_THRESHOLDS[i]}?{'YES' if min(h,a)>=SET_THRESHOLDS[i] else 'NO'})"
+            for i, (h, a) in enumerate(sets[:3])
+        )
+        print(f"[analyzer] no signal : sets did not qualify | {details}")
         print()
-        return None
+        return
 
-    print(f"[analyzer] signal    : {match_name} | {chosen_label} @ {chosen_odd}")
+    print(f"[analyzer] sets ok   : all 3 thresholds met")
+
+    market, over_sel, chosen_line = _pick_market(markets)
+    if market is None:
+        print(f"[analyzer] no signal : no qualifying line found in {TARGET_LINES}")
+        print()
+        return
+
+    odd_value    = over_sel["odd"]["value"]
+    selection_id = over_sel["id"]
+
+    print(f"[analyzer] signal    : {match_name} | Over {chosen_line} @ {odd_value}")
     print()
 
-    return {
-        "eventId":              event_id,
-        "matchId":              event_id,
-        "parentEventId":        event_id,
-        "matchName":            match_name,
-        "matchKMId":            event_id % 10_000_000,
-        "tournamentId":         tournament_id,
-        "tournamentName":       tournament,
-        "categoryId":           category_id,
-        "categoryName":         category_name,
-        "marketId":             chosen_market["Id"],
-        "marketName":           chosen_market["Name"],
-        "marketTypeId":         chosen_market["TypeId"],
-        "marketKMId":           chosen_market["Id"] % 10_000_000,
-        "specialValue":         special_value,
-        "selectionId":          chosen_sel["Id"],
-        "selectionName":        chosen_label,
-        "selectionKMId":        1_000_000_000 + chosen_sel["Id"] % 100_000_000,
-        "selectionTypeId":      chosen_sel.get("TypeId"),
-        "oddValue":             chosen_odd,
-        "score":                score_str,
-        "matchTime":            match_time,
-        "targetLine":           chosen_label,
-        "homeTeam":             home_team,
-        "awayTeam":             away_team,
+    payload = {
+        "eventId":         event_id,
+        "matchId":         event_id,
+        "parentEventId":   event_id,
+        "matchName":       match_name,
+        "matchKMId":       event_id,
+        "tournamentId":    tournament_id,
+        "tournamentName":  tournament,
+        "categoryId":      category_id,
+        "categoryName":    category_name,
+        "eventDate":       event_date,
+        "marketId":        market["marketId"],
+        "marketName":      market["name"],
+        "marketTypeId":    market["marketTypeId"],
+        "marketKMId":      market["marketId"] - 240_000_000,
+        "specialValue":    str(market.get("specialValue", "")),
+        "selectionId":     selection_id,
+        "selectionName":   f"Over ({market.get('specialValue', '')})",
+        "selectionKMId":   selection_id - 820_000_000,
+        "selectionTypeId": over_sel.get("typeId"),
+        "oddValue":        odd_value,
+        "lineValue":       chosen_line,
+        "periodScores":    period_scores,
     }
+
+    if staker is not None:
+        await staker.queue(payload)
