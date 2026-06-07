@@ -107,7 +107,10 @@ async def main_async():
     cycle       = 1
     try:
         while True:
-            await run_once(cycle, seen, staker)
+            try:
+                await run_once(cycle, seen, staker)
+            except Exception as e:
+                print(f"[tracker] cycle error: {e}")
             cycle += 1
             print(f"[tracker] next cycle in {INTERVAL}s ...")
             await asyncio.sleep(INTERVAL)
