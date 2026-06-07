@@ -1,7 +1,5 @@
 import httpx
 import asyncio
-import os
-import sys
 
 
 #Config
@@ -20,8 +18,9 @@ EVENT_HEADERS = {
     "Te":              "trailers",
 }
 
+# Market typeId for "game - total points"
 GAME_TOTAL_TYPE_ID = 10637
-TARGET_LINES       = [15.5, 16.5]
+TARGET_LINES       = [15.5, 16.5]   # checked in order; first qualifying wins
 TARGET_SELECTION   = "Over"
 MIN_ODD            = 1.18
 
@@ -33,26 +32,17 @@ def _build_referer(event_id: int) -> str:
     return f"https://m.betking.com/en-ng/sports/live/{event_id}"
 
 
-def _get_cookie() -> str:
-    try:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        sys.path.insert(0, base)
-        from supabase import create_client
-        config = {}
-        with open(os.path.join(base, "db.txt")) as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, _, v = line.partition("=")
-                    config[k.strip()] = v.strip().strip('"')
-        sb = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-        return sb.table("betking").select("cookie").eq("id", 1).single().execute().data["cookie"]
-    except Exception as e:
-        print(f"[analyzer] cookie err : {e}")
-        return ""
+def _resolve_market_name(market: dict) -> str:
+    """
+    Resolve '{gamenr} game - total points {line}' using specifiers.
+    e.g. specialValue=4, lineValue=16.5 → 'Set 4 - Total Points'
+    """
+    gamenr = market.get("specifiers", {}).get("gamenr") or market.get("specialValue", "?")
+    return f"Set {gamenr} - Total Points"
 
 
 def _parse_period_scores(period_scores: str) -> list[tuple[int, int]]:
+    """Parse '6:11 - 11:9 - 11:7' into [(6,11), (11,9), (11,7)]."""
     sets = []
     for part in period_scores.split(" - "):
         part = part.strip()
@@ -67,16 +57,22 @@ def _parse_period_scores(period_scores: str) -> list[tuple[int, int]]:
 
 
 def _sets_qualify(sets: list[tuple[int, int]]) -> bool:
+    """
+    Check first 3 sets. In each set the loser must have scored
+    at least the threshold for that set position.
+    """
     if len(sets) < 3:
         return False
     for i, threshold in enumerate(SET_THRESHOLDS):
         h, a = sets[i]
-        if min(h, a) < threshold:
+        loser_score = min(h, a)
+        if loser_score < threshold:
             return False
     return True
 
 
 def _find_market(markets: list, line: float) -> dict | None:
+    """Find the game total points market with the given lineValue."""
     for market in markets:
         if market.get("marketTypeId") != GAME_TOTAL_TYPE_ID:
             continue
@@ -87,6 +83,7 @@ def _find_market(markets: list, line: float) -> dict | None:
 
 
 def _get_over_selection(market: dict) -> dict | None:
+    """Return the Over selection if active and odd meets minimum."""
     for sel in market.get("selections", []):
         if sel.get("name") != TARGET_SELECTION:
             continue
@@ -99,7 +96,11 @@ def _get_over_selection(market: dict) -> dict | None:
     return None
 
 
-def _pick_market(markets: list) -> tuple:
+def _pick_market(markets: list) -> tuple[dict, dict, float] | tuple[None, None, None]:
+    """
+    Try TARGET_LINES in order. Return (market, over_sel, line) for the
+    first line whose Over selection exists and meets MIN_ODD, else (None, None, None).
+    """
     for line in TARGET_LINES:
         market = _find_market(markets, line)
         if market is None:
@@ -114,14 +115,32 @@ def _pick_market(markets: list) -> tuple:
 
 
 async def fetch_event(event_id: int) -> dict | None:
-    fixture_id = event_id % 10_000_000  # e.g. 34519718 → 4519718
-    url        = EVENT_URL.format(fixture_id=fixture_id)
-    cookie     = _get_cookie()
-    headers    = {
+    url = EVENT_URL.format(fixture_id=event_id)
+
+    try:
+        import os, sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from supabase import create_client
+        base   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config = {}
+        with open(os.path.join(base, "db.txt")) as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    config[k.strip()] = v.strip().strip('"')
+        sb     = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
+        cookie = sb.table("betking").select("cookie").eq("id", 1).single().execute().data["cookie"]
+    except Exception as e:
+        print(f"[analyzer] cookie err {event_id}: {e}")
+        cookie = ""
+
+    headers = {
         **EVENT_HEADERS,
         "Referer": _build_referer(event_id),
         "Cookie":  cookie,
     }
+
     try:
         async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
             resp = await client.get(url, headers=headers)
@@ -132,11 +151,8 @@ async def fetch_event(event_id: int) -> dict | None:
             print(f"[analyzer] fetch failed {event_id}: empty response")
             return None
         data = resp.json()
-        if not isinstance(data, dict):
-            print(f"[analyzer] fetch failed {event_id}: non-dict response type={type(data)}")
-            return None
-        if "event" not in data or not isinstance(data["event"], dict):
-            print(f"[analyzer] fetch failed {event_id}: missing or null event | keys={list(data.keys())}")
+        if not isinstance(data, dict) or "event" not in data:
+            print(f"[analyzer] fetch failed {event_id}: unexpected response | keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
             return None
         return data
     except Exception as e:
@@ -147,20 +163,19 @@ async def fetch_event(event_id: int) -> dict | None:
 async def analyze(event_id: int, staker=None) -> None:
     raw = await fetch_event(event_id)
     if raw is None:
-        print()
         return
 
-    event   = raw["event"]   # guaranteed dict by fetch_event
-    markets = raw.get("markets") or []
+    event   = raw.get("event") or {}
+    markets = raw.get("markets", [])
 
-    match_name    = event.get("name", "?")
-    period_scores = event.get("periodScores", "")
-    tournament_id = event.get("tournamentId")
-    tournament    = event.get("tournamentName", "?")
-    category_id   = event.get("categoryId")
-    category_name = event.get("categoryName", "")
-    event_date    = event.get("date", "")
-    match_status  = event.get("matchStatus", "")
+    match_name     = event.get("name", "?")
+    period_scores  = event.get("periodScores", "")
+    tournament_id  = event.get("tournamentId")
+    tournament     = event.get("tournamentName", "?")
+    category_id    = event.get("categoryId")
+    category_name  = event.get("categoryName", "")
+    event_date     = event.get("date", "")
+    match_status   = event.get("matchStatus", "")
 
     print(f"[analyzer] checking  : {match_name}")
     print(f"[analyzer] sets      : {period_scores}")
@@ -184,8 +199,11 @@ async def analyze(event_id: int, staker=None) -> None:
         print()
         return
 
-    odd_value    = over_sel["odd"]["value"]
-    selection_id = over_sel["id"]
+    odd_value      = over_sel["odd"]["value"]
+    selection_id   = over_sel["id"]
+    gamenr         = market.get("specifiers", {}).get("gamenr") or market.get("specialValue", "?")
+    resolved_name  = _resolve_market_name(market)
+    selection_name = f"Over ({gamenr})-{resolved_name}"
 
     print(f"[analyzer] signal    : {match_name} | Over {chosen_line} @ {odd_value}")
     print()
@@ -195,19 +213,19 @@ async def analyze(event_id: int, staker=None) -> None:
         "matchId":         event_id,
         "parentEventId":   event_id,
         "matchName":       match_name,
-        "matchKMId":       event_id % 10_000_000,
+        "matchKMId":       event_id,
         "tournamentId":    tournament_id,
         "tournamentName":  tournament,
         "categoryId":      category_id,
         "categoryName":    category_name,
         "eventDate":       event_date,
         "marketId":        market["marketId"],
-        "marketName":      f"Set {int(market.get('specialValue', 4))} - Total Points",
+        "marketName":      resolved_name,
         "marketTypeId":    market["marketTypeId"],
         "marketKMId":      market["marketId"] - 240_000_000,
         "specialValue":    str(market.get("specialValue", "")),
         "selectionId":     selection_id,
-        "selectionName":   f"Over ({market.get('specialValue', '')})",
+        "selectionName":   selection_name,
         "selectionKMId":   selection_id - 820_000_000,
         "selectionTypeId": over_sel.get("typeId"),
         "oddValue":        odd_value,
