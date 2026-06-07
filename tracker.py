@@ -7,7 +7,7 @@ from staker import Staker
 
 #Config
 INTERVAL      = 10
-TARGET_STATUS = "3rd pause"
+TARGET_STATUS = "4th pause"
 
 TT_URL = (
     "https://m.betking.com/en-ng/sports/live/api/overview/20"
