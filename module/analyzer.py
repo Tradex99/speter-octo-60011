@@ -1,237 +1,1 @@
-import httpx
-import asyncio
-
-
-#Config
-EVENT_URL = "https://m.betking.com/en-ng/sports/live/api/event?areaId=2&fixtureId={fixture_id}&_data=routes%2F%28%24locale%29.sports.live.api.event"
-
-EVENT_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-    "Accept":          "*/*",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Dnt":             "1",
-    "Sec-Gpc":         "1",
-    "Sec-Fetch-Dest":  "empty",
-    "Sec-Fetch-Mode":  "cors",
-    "Sec-Fetch-Site":  "same-origin",
-    "Priority":        "u=4",
-    "Te":              "trailers",
-}
-
-# Market typeId for "game - total points"
-GAME_TOTAL_TYPE_ID = 10637
-TARGET_LINES       = [15.5, 16.5]   # checked in order; first qualifying wins
-TARGET_SELECTION   = "Over"
-MIN_ODD            = 1.18
-
-# Minimum loser score per set — loser must score >= 8 in each of the 3 sets
-SET_THRESHOLDS = [7, 7, 7, 7]
-
-
-def _build_referer(event_id: int) -> str:
-    return f"https://m.betking.com/en-ng/sports/live/{event_id}"
-
-
-def _resolve_market_name(market: dict) -> str:
-    """
-    Resolve '{gamenr} game - total points {line}' using specifiers.
-    e.g. specialValue=4, lineValue=16.5 → 'Set 4 - Total Points'
-    """
-    gamenr = market.get("specifiers", {}).get("gamenr") or market.get("specialValue", "?")
-    return f"Set {gamenr} - Total Points"
-
-
-def _parse_period_scores(period_scores: str) -> list[tuple[int, int]]:
-    """Parse '6:11 - 11:9 - 11:7' into [(6,11), (11,9), (11,7)]."""
-    sets = []
-    for part in period_scores.split(" - "):
-        part = part.strip()
-        if not part or ":" not in part:
-            continue
-        try:
-            h, a = part.split(":")
-            sets.append((int(h), int(a)))
-        except ValueError:
-            continue
-    return sets
-
-
-def _sets_qualify(sets: list[tuple[int, int]]) -> bool:
-    """
-    Check first 3 sets. In each set the loser must have scored
-    at least the threshold for that set position.
-    """
-    if len(sets) < 4:
-        return False
-    for i, threshold in enumerate(SET_THRESHOLDS):
-        h, a = sets[i]
-        loser_score = min(h, a)
-        if loser_score < threshold:
-            return False
-    return True
-
-
-def _find_market(markets: list, line: float) -> dict | None:
-    """Find the game total points market with the given lineValue."""
-    for market in markets:
-        if market.get("marketTypeId") != GAME_TOTAL_TYPE_ID:
-            continue
-        if market.get("lineValue") != line:
-            continue
-        return market
-    return None
-
-
-def _get_over_selection(market: dict) -> dict | None:
-    """Return the Over selection if active and odd meets minimum."""
-    for sel in market.get("selections", []):
-        if sel.get("name") != TARGET_SELECTION:
-            continue
-        odd = sel.get("odd", {})
-        if odd.get("statusId") != 1:
-            return None
-        if odd.get("value", 0.0) < MIN_ODD:
-            return None
-        return sel
-    return None
-
-
-def _pick_market(markets: list) -> tuple[dict, dict, float] | tuple[None, None, None]:
-    """
-    Try TARGET_LINES in order. Return (market, over_sel, line) for the
-    first line whose Over selection exists and meets MIN_ODD, else (None, None, None).
-    """
-    for line in TARGET_LINES:
-        market = _find_market(markets, line)
-        if market is None:
-            print(f"[analyzer] no market : game total {line} not found")
-            continue
-        over_sel = _get_over_selection(market)
-        if over_sel is None:
-            print(f"[analyzer] no signal : Over {line} suspended or odd below {MIN_ODD}")
-            continue
-        return market, over_sel, line
-    return None, None, None
-
-
-async def fetch_event(event_id: int) -> dict | None:
-    url = EVENT_URL.format(fixture_id=event_id)
-
-    try:
-        import os, sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from supabase import create_client
-        base   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        config = {}
-        with open(os.path.join(base, "db.txt")) as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, _, v = line.partition("=")
-                    config[k.strip()] = v.strip().strip('"')
-        sb     = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
-        cookie = sb.table("betking").select("cookie").eq("id", 1).single().execute().data["cookie"]
-    except Exception as e:
-        print(f"[analyzer] cookie err {event_id}: {e}")
-        cookie = ""
-
-    headers = {
-        **EVENT_HEADERS,
-        "Referer": _build_referer(event_id),
-        "Cookie":  cookie,
-    }
-
-    try:
-        async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
-            resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            print(f"[analyzer] fetch failed {event_id}: HTTP {resp.status_code}")
-            return None
-        if not resp.text or not resp.text.strip():
-            print(f"[analyzer] fetch failed {event_id}: empty response")
-            return None
-        data = resp.json()
-        if not isinstance(data, dict) or "event" not in data:
-            print(f"[analyzer] fetch failed {event_id}: unexpected response | keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
-            return None
-        return data
-    except Exception as e:
-        print(f"[analyzer] fetch error {event_id}: {e}")
-        return None
-
-
-async def analyze(event_id: int, staker=None) -> None:
-    raw = await fetch_event(event_id)
-    if raw is None:
-        return
-
-    event   = raw.get("event") or {}
-    markets = raw.get("markets", [])
-
-    match_name     = event.get("name", "?")
-    period_scores  = event.get("periodScores", "")
-    tournament_id  = event.get("tournamentId")
-    tournament     = event.get("tournamentName", "?")
-    category_id    = event.get("categoryId")
-    category_name  = event.get("categoryName", "")
-    event_date     = event.get("date", "")
-    match_status   = event.get("matchStatus", "")
-
-    print(f"[analyzer] checking  : {match_name}")
-    print(f"[analyzer] sets      : {period_scores}")
-    print(f"[analyzer] status    : {match_status}")
-
-    sets = _parse_period_scores(period_scores)
-    if not _sets_qualify(sets):
-        details = " | ".join(
-            f"set{i+1}: {h}:{a} (loser={min(h,a)}>={SET_THRESHOLDS[i]}?{'YES' if min(h,a)>=SET_THRESHOLDS[i] else 'NO'})"
-            for i, (h, a) in enumerate(sets[:3])
-        )
-        print(f"[analyzer] no signal : sets did not qualify | {details}")
-        print()
-        return
-
-    print(f"[analyzer] sets ok   : all 3 thresholds met")
-
-    market, over_sel, chosen_line = _pick_market(markets)
-    if market is None:
-        print(f"[analyzer] no signal : no qualifying line found in {TARGET_LINES}")
-        print()
-        return
-
-    odd_value      = over_sel["odd"]["value"]
-    selection_id   = over_sel["id"]
-    gamenr         = market.get("specifiers", {}).get("gamenr") or market.get("specialValue", "?")
-    resolved_name  = _resolve_market_name(market)
-    selection_name = f"Over ({gamenr})-{resolved_name}"
-
-    print(f"[analyzer] signal    : {match_name} | Over {chosen_line} @ {odd_value}")
-    print()
-
-    payload = {
-        "eventId":         event_id,
-        "matchId":         event_id,
-        "parentEventId":   event_id,
-        "matchName":       match_name,
-        "matchKMId":       event_id,
-        "tournamentId":    tournament_id,
-        "tournamentName":  tournament,
-        "categoryId":      category_id,
-        "categoryName":    category_name,
-        "eventDate":       event_date,
-        "marketId":        market["marketId"],
-        "marketName":      resolved_name,
-        "marketTypeId":    market["marketTypeId"],
-        "marketKMId":      market["marketId"] - 240_000_000,
-        "specialValue":    str(market.get("specialValue", "")),
-        "selectionId":     selection_id,
-        "selectionName":   selection_name,
-        "selectionKMId":   selection_id - 820_000_000,
-        "selectionTypeId": over_sel.get("typeId"),
-        "oddValue":        odd_value,
-        "lineValue":       chosen_line,
-        "periodScores":    period_scores,
-    }
-
-    if staker is not None:
-        await staker.queue(payload)
+import httpximport asyncioimport jsonimport osimport sysimport randomfrom urllib.parse import urlencode# ── Config ────────────────────────────────────────────────────────────────────POLL_INTERVAL = 1.0STAKE_AMOUNT  = 10EVENT_URL = (    "https://m.betking.com/en-ng/sports/live/api/event"    "?areaId=4&fixtureId={fixture_id}"    "&_data=routes%2F%28%24locale%29.sports.live.api.event")PLACEBET_URL = (    "https://m.betking.com/en-ng/sports/action/placebet"    "?_data=routes%2F%28%24locale%29.sports.action.placebet")EVENT_HEADERS = {    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",    "Accept":          "*/*",    "Accept-Language": "en-US,en;q=0.5",    "Dnt":             "1",    "Sec-Gpc":         "1",    "Sec-Fetch-Dest":  "empty",    "Sec-Fetch-Mode":  "cors",    "Sec-Fetch-Site":  "same-origin",    "Priority":        "u=4",    "Te":              "trailers",}PLACEBET_HEADERS = {    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",    "Accept":          "*/*",    "Accept-Language": "en-US,en;q=0.5",    "Referer":         "https://m.betking.com/en-ng",    "Content-Type":    "application/x-www-form-urlencoded;charset=UTF-8",    "Origin":          "https://m.betking.com",    "Dnt":             "1",    "Sec-Gpc":         "1",    "Sec-Fetch-Dest":  "empty",    "Sec-Fetch-Mode":  "cors",    "Sec-Fetch-Site":  "same-origin",    "Priority":        "u=4",    "Te":              "trailers",}# marketTypeId for "{gamenr} game - point handicap {line}"HANDICAP_TYPE_ID = 10636# Format: (hi, lo, lines_to_try, is_tie)SCORE_TRIGGERS = [    (6,  6,  [-4.5,  4.5],  True),    (7,  7,  [-3.5,  3.5],  True),    (9,  9,  [-1.5,  1.5],  True),    (10, 10, [-1.5,  1.5],  True),    (7,  6,  [-4.5,  4.5],  False),    (8,  6,  [-4.5,  4.5],  False),]# TEST MODETEST_MODE      = FalseTEST_GAP_LINES = [-3.5, 3.5]MIN_ODD = 1.18# ── DB config + cookie ────────────────────────────────────────────────────────def _load_db_config() -> dict:    base   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))    config = {}    with open(os.path.join(base, "db.txt"), "r") as f:        for line in f:            line = line.strip()            if not line or line.startswith("#"):                continue            if "=" in line:                k, _, v = line.partition("=")                config[k.strip()] = v.strip().strip('"')    return configdef _load_cookie() -> str:    try:        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))        sys.path.insert(0, base)        from supabase import create_client        config = _load_db_config()        sb     = create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])        return sb.table("betking").select("cookie").eq("id", 1).single().execute().data["cookie"]    except Exception as e:        print(f"[analyzer] cookie err: {e}")        return ""# ── Score parsing ─────────────────────────────────────────────────────────────def _parse_period_scores(period_scores: str) -> list[tuple[int, int]]:    sets = []    for part in period_scores.split(" - "):        part = part.strip()        if not part or ":" not in part:            continue        try:            h, a = part.split(":")            sets.append((int(h), int(a)))        except ValueError:            continue    return sets# ── Trigger lookup ────────────────────────────────────────────────────────────def _get_trigger(home: int, away: int):    hi = max(home, away)    lo = min(home, away)    for trigger_hi, trigger_lo, lines, is_tie in SCORE_TRIGGERS:        if hi == trigger_hi and lo == trigger_lo:            return lines, is_tie    return Nonedef _losing_side(home: int, away: int) -> str:    if home < away:        return "1"    elif away < home:        return "2"    return "tie"# ── Market finder ─────────────────────────────────────────────────────────────def _find_handicap_market(    markets: list,    set_number: int,    line_value: float,    losing_side: str,) -> tuple[dict, dict] | tuple[None, None]:    for market in markets:        if market.get("marketTypeId") != HANDICAP_TYPE_ID:            continue        specs  = market.get("specifiers", {})        gamenr = str(specs.get("gamenr") or market.get("specialValue", ""))        if gamenr != str(set_number):            continue        if market.get("lineValue") != line_value:            continue        target_name = "2" if line_value < 0 else "1"        if losing_side != "tie" and target_name != losing_side:            continue        for sel in market.get("selections", []):            if sel.get("name") != target_name:                continue            if sel.get("status") != "VALID":                continue            odd = sel.get("odd", {})            if odd.get("statusId") != 1:                continue            if odd.get("value", 0.0) < MIN_ODD:                continue            return market, sel    return None, None# ── Bet payload builder ───────────────────────────────────────────────────────def _build_body(p: dict, tx_id: str) -> str:    odd   = p["oddValue"]    stake = STAKE_AMOUNT    win   = round(stake * odd, 2)    sel_name = f"{p['selectionSide']} ({p['specialValue']})"    grouping = {        "grouping":           1,        "combinations":       1,        "minWin":             win,        "minWinNet":          win,        "netStakeMinWin":     win,        "maxWin":             win,        "maxWinNet":          win,        "netStakeMaxWin":     win,        "minBonus":           0,        "maxBonus":           0,        "minPercentageBonus": 0,        "maxPercentageBonus": 0,        "stake":              stake,        "netStake":           stake,        "selected":           True,    }    coupon = {        "betCoupon": {            "isClientSideCoupon":  True,            "couponTypeId":        1,            "minWin":              win,            "minWinNet":           win,            "netStakeMinWin":      win,            "maxWin":              win,            "maxWinNet":           win,            "netStakeMaxWin":      win,            "minBonus":            0,            "maxBonus":            0,            "minPercentageBonus":  0,            "maxPercentageBonus":  0,            "minOdd":              odd,            "maxOdd":              odd,            "totalOdds":           odd,            "stake":               stake,            "useGroupsStake":      False,            "stakeGross":          stake,            "stakeTaxed":          0,            "taxPercentage":       0,            "tax":                 0,            "minWithholdingTax":   0,            "maxWithholdingTax":   0,            "turnoverTax":         0,            "totalCombinations":   1,            "odds": [{                "IDSelectionType":    p["selectionTypeId"],                "IDSport":            20,                "allowFixed":         True,                "compatibilityLevel": 0,                "eventCategory":      "L",                "eventDate":          p["eventDate"],                "eventId":            p["categoryId"],                "eventName":          p["categoryName"],                "fixed":              False,                "gamePlay":           1,                "incompatibleEvents": [],                "isExpired":          False,                "isLocked":           False,                "isBetBuilder":       False,                "marketId":           p["marketId"],                "marketName":         p["marketName"],                "marketTag":          0,                "marketTypeId":       p["marketTypeId"],                "matchId":            p["matchId"],                "matchName":          p["matchName"],                "oddValue":           odd,                "parentEventId":      p["matchId"],                "selectionId":        p["selectionId"],                "selectionName":      sel_name,                "smartCode":          0,                "specialValue":       p["specialValue"],                "sportName":          "Table Tennis",                "tournamentId":       p["tournamentId"],                "tournamentName":     p["tournamentName"],                "selectionKMId":      p["selectionId"] - 820_000_000,                "matchKMId":          p["matchId"]     - 30_000_000,                "marketKMId":         p["marketId"]    - 240_000_000,                "isTransitioned":     False,            }],            "groupings":               [grouping],            "possibleMissingGroupings": [],            "currencyId":              -1,            "isLive":                  True,            "isVirtual":               False,            "currentEvalMotivation":   0,            "betCouponGlobalVariable": {                "currencyId":                -1,                "defaultStakeGross":         100,                "isVirtualsInstallation":    False,                "maxBetStake":               75000000,                "maxCombinationBetWin":      75000000,                "maxCombinationsByGrouping": 10000,                "maxCouponCombinations":     10000,                "maxGroupingsBetStake":      41641682,                "maxMultipleBetWin":         75000000,                "maxNoOfEvents":             40,                "maxNoOfSelections":         40,                "maxSingleBetWin":           75000000,                "minBetStake":               10,                "minBonusOdd":               1.35,                "minFlexiCutOdds":           1.05,                "minFlexiCutSelections":     5,                "minGroupingsBetStake":      5,                "stakeInnerMod0Combination": 0.01,                "stakeMod0Multiple":         0,                "stakeMod0Single":           0,                "stakeThresholdMultiple":    75000,                "stakeThresholdSingle":      7500,                "flexiCutGlobalVariable": {                    "parameters": {                        "formulaId":            1,                        "minOddThreshold":      1.05,                        "minWinningSelections": 2,                    }                },            },            "language":     "en",            "hasLive":      True,            "couponType":   1,            "allGroupings": [grouping],        },        "allowOddChanges":        True,        "allowStakeReduction":    False,        "requestTransactionId":   tx_id,        "transferStakeFromAgent": False,        "trackingData": {            "category":      "table tennis",            "product":       "sportsbook-live",            "is_quick_slip": True,            "bet_type":      "Singles",        },    }    adjust = {"adjustId": "", "adjustIdfa": "", "gpsAdId": ""}    return urlencode({        "data":      json.dumps(coupon, separators=(",", ":")),        "adjustIds": json.dumps(adjust, separators=(",", ":")),    })# ── Place bet ─────────────────────────────────────────────────────────────────async def _place_bet(p: dict, cookie: str) -> bool:    match    = p["matchName"]    odd      = p["oddValue"]    line     = p["lineValue"]    set_num  = p["specialValue"]    sel_side = p["selectionSide"]    print(f"[staker] placing    : {match}")    print(f"[staker] bet        : Set {set_num} handicap {line:+g} | side={sel_side} | odd={odd}")    tx_id   = str(random.randint(10_000_000_000, 99_999_999_999))    headers = {**PLACEBET_HEADERS, "Cookie": cookie}    body    = _build_body(p, tx_id)    try:        async with httpx.AsyncClient(http2=True, timeout=20.0) as client:            resp = await client.put(PLACEBET_URL, headers=headers, content=body.encode())    except Exception as e:        print(f"[staker] req err    : {e}")        return False    if resp.status_code in (401, 301):        print(f"[staker] session    : expired ({resp.status_code}) — re-login needed")        try:            from login import login            await login()        except Exception as e:            print(f"[staker] login err  : {e}")        return False    if resp.status_code != 200:        print(f"[staker] failed     : HTTP {resp.status_code}")        return False    if not resp.text or not resp.text.strip():        print(f"[staker] session    : expired (empty body) — re-login needed")        try:            from login import login            await login()        except Exception as e:            print(f"[staker] login err  : {e}")        return False    try:        data        = resp.json()        coupon_code = data.get("couponCode")        status      = data.get("responseStatus")    except Exception:        print(f"[staker] parse err  : could not parse response")        return False    if coupon_code:        print(f"[staker] placed     : {match} | Set {set_num} {line:+g} side={sel_side} @ {odd}")        print(f"[staker] coupon     : {coupon_code}")        return True    else:        errors   = data.get("errorsList", {})        messages = data.get("messages", [])        print(f"[staker] rejected   : {match} | status={status} | errors={errors} | messages={messages}")        print(f"[staker] raw resp   : {json.dumps(data)[:300]}")        return False# ── Fetch event API ───────────────────────────────────────────────────────────async def fetch_event(event_id: int, cookie: str) -> dict | None:    url     = EVENT_URL.format(fixture_id=event_id)    headers = {        **EVENT_HEADERS,        "Referer": f"https://m.betking.com/en-ng/sports/live/{event_id}",        "Cookie":  cookie,    }    try:        async with httpx.AsyncClient(http2=True, timeout=10.0) as client:            resp = await client.get(url, headers=headers)        if resp.status_code == 200:            text = resp.text            if not text or not text.strip():                return None            data = resp.json()            if not isinstance(data, dict):                return None            return data        if resp.status_code == 404:            return {"event": None, "markets": []}        print(f"[analyzer] fetch HTTP {resp.status_code} for {event_id} — retrying")        return None    except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:        print(f"[analyzer] fetch transient error {event_id}: {type(e).__name__} — retrying")        return None    except Exception as e:        print(f"[analyzer] fetch error {event_id}: {e}")        return None# ── Main analyze + bet loop ───────────────────────────────────────────────────async def analyze(event_id: int, on_bet_placed=None) -> None:    print(f"[analyzer] worker started : eventId={event_id}")    cookie      = _load_cookie()    bet_placed  = False    last_logged = None    while True:        await asyncio.sleep(POLL_INTERVAL)        raw = await fetch_event(event_id, cookie)        if raw is None:            continue        if raw.get("event") is None and raw.get("markets") == []:            print(f"[analyzer] match ended    : eventId={event_id} | releasing worker")            return        event   = raw.get("event") or {}        markets = raw.get("markets", [])        if not event:            continue        match_name    = event.get("name", "?")        period_scores = event.get("periodScores", "")        sets = _parse_period_scores(period_scores)        if not sets:            continue        cur_set    = len(sets)        home, away = sets[-1]        score_key  = (home, away, cur_set)        # ── TEST MODE ─────────────────────────────────────────────────────────        if TEST_MODE and not bet_placed:            gap         = abs(home - away)            losing_side = _losing_side(home, away)            if gap in (2, 3) and losing_side != "tie":                if score_key != last_logged:                    last_logged = score_key                    print(f"[analyzer] test trigger  : {match_name} | {home}:{away} | gap={gap} | losing={losing_side} | set={cur_set}")                    found_bet = False                    for line in TEST_GAP_LINES:                        m, sel = _find_handicap_market(markets, cur_set, line, losing_side)                        if m and sel:                            print(f"[analyzer] market found  : line={line:+g} | odd={sel['odd']['value']} | side={sel['name']}")                            found_bet = True                            bet_placed = await _fire_bet(event, event_id, m, sel, line, cur_set, period_scores, cookie, on_bet_placed)                            break                    if not found_bet:                        print(f"[analyzer] no market     : {match_name} | {home}:{away} | tried={TEST_GAP_LINES}")            continue        # ── Standard trigger ──────────────────────────────────────────────────        if not bet_placed:            result = _get_trigger(home, away)            if not result:                continue            lines, is_tie = result            if is_tie:                side = None                best_m, best_sel, best_line = None, None, None                for line in lines:                    for try_side in ["1", "2"]:                        m, sel = _find_handicap_market(markets, cur_set, line, try_side)                        if m and sel:                            best_m, best_sel, best_line, side = m, sel, line, try_side                            break                    if best_m:                        break                if score_key != last_logged:                    last_logged = score_key                    if best_m:                        print(f"[analyzer] tie trigger   : {match_name} | {home}:{away} | set={cur_set} | line={best_line:+g} | side={side}")                        bet_placed = await _fire_bet(event, event_id, best_m, best_sel, best_line, cur_set, period_scores, cookie, on_bet_placed)                    else:                        print(f"[analyzer] no market     : {match_name} | {home}:{away} | tried={lines}")            else:                losing_side = _losing_side(home, away)                if score_key != last_logged:                    last_logged = score_key                    print(f"[analyzer] trigger hit   : {match_name} | {home}:{away} | set={cur_set} | losing={losing_side}")                    found_bet = False                    for line in lines:                        m, sel = _find_handicap_market(markets, cur_set, line, losing_side)                        if m and sel:                            print(f"[analyzer] market found  : line={line:+g} | odd={sel['odd']['value']} | side={sel['name']}")                            found_bet = True                            bet_placed = await _fire_bet(event, event_id, m, sel, line, cur_set, period_scores, cookie, on_bet_placed)                            break                    if not found_bet:                        print(f"[analyzer] no market     : {match_name} | {home}:{away} | tried={lines}")# ── Build payload and fire bet ────────────────────────────────────────────────async def _fire_bet(    event: dict,    event_id: int,    market: dict,    selection: dict,    line_value: float,    set_number: int,    period_scores: str,    cookie: str,    on_bet_placed=None,) -> bool:    specs       = market.get("specifiers", {})    special_val = str(specs.get("gamenr") or market.get("specialValue", str(set_number)))    market_name = f"Set {special_val} - Point Handicap"    payload = {        "matchId":         event_id,        "matchName":       event.get("name", "?"),        "categoryId":      event.get("categoryId"),        "categoryName":    event.get("categoryName", ""),        "eventDate":       event.get("date", ""),        "tournamentId":    event.get("tournamentId"),        "tournamentName":  event.get("tournamentName", "?"),        "marketId":        market["marketId"],        "marketName":      market_name,        "marketTypeId":    market["marketTypeId"],        "specialValue":    special_val,        "selectionId":     selection["id"],        "selectionSide":   selection["name"],        "selectionTypeId": selection.get("typeId"),        "oddValue":        selection["odd"]["value"],        "lineValue":       line_value,        "periodScores":    period_scores,    }    success = await _place_bet(payload, cookie)    if success and on_bet_placed:        await on_bet_placed()    return success
