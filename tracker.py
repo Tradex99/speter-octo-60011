@@ -175,6 +175,8 @@ async def main_async():
         can_bet[0] = await check_can_bet()
         if not can_bet[0]:
             print(f"[tracker] betting halted : daily limit already reached at startup")
+            print(f"[tracker] shutdown complete")
+            return
     except Exception as e:
         print(f"[tracker] betlist error  : {e}")
 
@@ -192,6 +194,14 @@ async def main_async():
                 print(f"[tracker] cycle error    : {e}")
 
             cycle += 1
+
+            if not can_bet[0]:
+                if active_workers:
+                    print(f"[tracker] betting halted : waiting for {len(active_workers)} worker(s) to finish ...")
+                    while active_workers:
+                        await asyncio.sleep(1)
+                print(f"[tracker] betting halted : daily limit reached — exiting")
+                break
 
             if len(active_workers) < MAX_WORKERS:
                 if quiet_cycles[0] == 0 or quiet_cycles[0] % 10 == 0:
