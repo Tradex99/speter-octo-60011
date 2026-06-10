@@ -10,8 +10,8 @@ from module.betlist  import check_can_bet
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INTERVAL      = 3
-MAX_WORKERS   = 5
+INTERVAL        = 3
+MAX_WORKERS     = 9
 
 TARGET_STATUSES = ["1st Set", "2nd Set", "3rd Set"]
 
@@ -35,7 +35,7 @@ TT_HEADERS = {
 }
 
 
-# ── Fetch overview ─────────────────────────────────────────────────────────────
+# ── Fetch overview ────────────────────────────────────────────────────────────
 async def fetch_live_events() -> dict | None:
     async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
         resp = await client.get(TT_URL, headers=TT_HEADERS)
@@ -48,7 +48,7 @@ async def fetch_live_events() -> dict | None:
     return resp.json()
 
 
-# ── Parse all events from overview ────────────────────────────────────────────
+# ── Parse events ──────────────────────────────────────────────────────────────
 def _extract_all_events(data: dict) -> list[dict]:
     events = []
     for sport in data.get("sportData", []):
@@ -65,11 +65,9 @@ def _extract_all_events(data: dict) -> list[dict]:
     return events
 
 
-# ── Pick up to MAX_WORKERS matches using priority status order ─────────────────
 def filter_qualifying_events(data: dict) -> list[dict]:
     all_events = _extract_all_events(data)
     collected  = []
-
     for status in TARGET_STATUSES:
         if len(collected) >= MAX_WORKERS:
             break
@@ -78,11 +76,10 @@ def filter_qualifying_events(data: dict) -> list[dict]:
                 break
             if event["status"].lower() == status.lower():
                 collected.append(event)
-
     return collected
 
 
-# ── Betlist check — runs as a background task after a confirmed bet ────────────
+# ── Betlist check ─────────────────────────────────────────────────────────────
 async def _run_betlist_check(can_bet: list):
     try:
         result     = await check_can_bet()
@@ -93,7 +90,7 @@ async def _run_betlist_check(can_bet: list):
         print(f"[tracker] betlist error  : {e}")
 
 
-# ── One tracker cycle ──────────────────────────────────────────────────────────
+# ── One tracker cycle ─────────────────────────────────────────────────────────
 async def run_once(cycle: int, seen: set, active_workers: set, quiet_cycles: list, can_bet: list):
     start   = time.time()
     data    = await fetch_live_events()
@@ -103,7 +100,6 @@ async def run_once(cycle: int, seen: set, active_workers: set, quiet_cycles: lis
         return
 
     qualifying = filter_qualifying_events(data)
-
     new_events = [
         e for e in qualifying
         if e["id"] not in seen and e["id"] not in active_workers
@@ -151,7 +147,6 @@ async def run_once(cycle: int, seen: set, active_workers: set, quiet_cycles: lis
     async def worker_wrapper(event: dict):
         async def on_bet_placed():
             asyncio.create_task(_run_betlist_check(can_bet))
-
         try:
             await analyze(event_id=event["id"], on_bet_placed=on_bet_placed)
         finally:
@@ -162,7 +157,7 @@ async def run_once(cycle: int, seen: set, active_workers: set, quiet_cycles: lis
         asyncio.create_task(worker_wrapper(e))
 
 
-# ── Main loop ──────────────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 async def main_async():
     seen           = set()
     active_workers = set()
