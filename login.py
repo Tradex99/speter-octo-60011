@@ -61,7 +61,12 @@ def _build_cookie(access_token: str, refresh_token: str) -> str:
         "ABTestPrematchToLiveTransition=true; "
         "ABTestCrossSellRollout=true; "
         "ABTestNewBuildCoupon=false; "
-        "ABTestMybetSettlementAwareRollout=C"
+        "ABTestMybetSettlementAwareRollout=C;"
+"ABTestRebetBuildCoupon=true;"
+"ajs_user_id=11779815;"
+"ajs_anonymous_id=254f2702-09e1-4a95-9ac2-2cc68528cb15;"
+"analytics_session_id=1781619216294;"
+"analytics_session_id.last_access=1781619282533"
     )
 
 
