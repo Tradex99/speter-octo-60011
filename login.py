@@ -4,8 +4,13 @@ import os
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from playwright.async_api import async_playwright
 
-#Config
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Config
+# ══════════════════════════════════════════════════════════════════════════════
+
 LOGIN_URL = "https://m.betking.com/islands/_actions/login/"
 USERNAME  = "09120183273"
 PASSWORD  = "Edmond99@"
@@ -26,6 +31,19 @@ LOGIN_HEADERS = {
     "Cookie":          "ABTestHomePrematchNewApi=true; ABTestHomePrematchBoostedNewApi=true",
 }
 
+OPEN_BETS_URL    = "https://m.betking.com/en-ng/my-bets/sports/open"
+SETTLED_API_PATH = "/en-ng/my-bets/sports/settled"
+
+SETTLED_BUTTON_SELECTOR = 'button[data-testid="coupon-filters-category-settled"]'
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB Helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _load_db_config():
     base   = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +65,17 @@ def _get_supabase():
     return create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
 
 
-def _build_cookie(access_token: str, refresh_token: str) -> str:
+# ══════════════════════════════════════════════════════════════════════════════
+# Cookie Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_seed_cookie(access_token: str, refresh_token: str) -> str:
+    """
+    Builds the initial cookie used only to seed the Playwright browser context
+    so the site treats us as logged in when it's opened. This is NOT what gets
+    saved to the DB anymore — the real cookie is captured later from the
+    browser's actual outgoing request to the settled-bets API.
+    """
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
                 f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
     ts_encoded = quote(timestamp, safe="")
@@ -61,14 +89,105 @@ def _build_cookie(access_token: str, refresh_token: str) -> str:
         "ABTestPrematchToLiveTransition=true; "
         "ABTestCrossSellRollout=true; "
         "ABTestNewBuildCoupon=false; "
-        "ABTestMybetSettlementAwareRollout=C;"
-"ABTestRebetBuildCoupon=true;"
-"ajs_user_id=11779815;"
-"ajs_anonymous_id=254f2702-09e1-4a95-9ac2-2cc68528cb15;"
-"analytics_session_id=1781619216294;"
-"analytics_session_id.last_access=1781619282533"
+        "ABTestMybetSettlementAwareRollout=C"
     )
 
+
+def _seed_cookie_to_playwright_cookies(seed_cookie: str, domain: str = "m.betking.com") -> list[dict]:
+    """
+    Converts a "key=value; key=value" cookie string into the list-of-dicts
+    format Playwright's add_cookies() expects.
+    """
+    cookies = []
+    for part in seed_cookie.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        cookies.append({
+            "name":   name.strip(),
+            "value":  value.strip(),
+            "domain": domain,
+            "path":   "/",
+        })
+    return cookies
+
+
+def _strip_cookie_prefix(raw_cookie_header: str) -> str:
+    """
+    The captured request header value is just the cookie string itself
+    (Playwright's request.headers already excludes the "Cookie:" name),
+    but we strip a leading "Cookie:" defensively in case it's ever present.
+    """
+    value = raw_cookie_header.strip()
+    if value.lower().startswith("cookie:"):
+        value = value[len("cookie:"):].strip()
+    return value
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Browser Cookie Capture
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _capture_real_cookie_via_browser(seed_cookie: str) -> str | None:
+    """
+    Launches Firefox via Playwright, seeds it with the tokens from the login
+    request, opens the open-bets page, clicks the "Settled" filter pill, and
+    listens for the outgoing request to the settled-bets API. Returns the
+    exact Cookie header value Firefox sent on that request — this is the
+    accurate, complete cookie (including anything the browser/server adds
+    that our manually-built string wouldn't have).
+    """
+    captured_cookie: str | None = None
+    capture_event = asyncio.Event()
+
+    async with async_playwright() as pw:
+        browser = await pw.firefox.launch(headless=True)
+        context = await browser.new_context(user_agent=BROWSER_USER_AGENT)
+
+        await context.add_cookies(_seed_cookie_to_playwright_cookies(seed_cookie))
+
+        page = await context.new_page()
+
+        def _on_request(request):
+            nonlocal captured_cookie
+            if captured_cookie is not None:
+                return
+            if SETTLED_API_PATH in request.url:
+                cookie_header = request.headers.get("cookie")
+                if cookie_header:
+                    captured_cookie = _strip_cookie_prefix(cookie_header)
+                    capture_event.set()
+
+        page.on("request", _on_request)
+
+        print("[login] opening open-bets page ...")
+        await page.goto(OPEN_BETS_URL, wait_until="domcontentloaded")
+
+        try:
+            await page.click(SETTLED_BUTTON_SELECTOR, timeout=15000)
+        except Exception as e:
+            print(f"[login] settled button click err : {e}")
+            await browser.close()
+            return None
+
+        print("[login] clicked Settled — waiting for API request ...")
+
+        try:
+            await asyncio.wait_for(capture_event.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            print("[login] timed out waiting for settled API request")
+            await browser.close()
+            return None
+
+        await browser.close()
+
+    return captured_cookie
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Login
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def login() -> bool:
     print("[login] sending login request ...")
@@ -127,12 +246,24 @@ async def login() -> bool:
         print(f"[login] failed     : empty tokens in response")
         return False
 
-    cookie = _build_cookie(access_token, refresh_token)
+    print("[login] request login succeeded — launching browser to capture real cookie ...")
+
+    seed_cookie = _build_seed_cookie(access_token, refresh_token)
+
+    try:
+        real_cookie = await _capture_real_cookie_via_browser(seed_cookie)
+    except Exception as e:
+        print(f"[login] browser capture err : {e}")
+        return False
+
+    if not real_cookie:
+        print(f"[login] failed     : could not capture real cookie from browser")
+        return False
 
     try:
         sb = _get_supabase()
-        sb.table("betking").update({"cookie": cookie}).eq("id", 1).execute()
-        print(f"[login] success    : cookie saved to DB")
+        sb.table("betking").update({"cookie": real_cookie}).eq("id", 1).execute()
+        print(f"[login] success    : real cookie saved to DB")
     except Exception as e:
         print(f"[login] db error   : {e}")
         return False
