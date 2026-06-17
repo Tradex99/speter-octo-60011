@@ -7,11 +7,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from module.analyzer import analyze
 from module.betlist  import check_can_bet
+from login            import login
 
 
 # ── Config ───────────────
-INTERVAL        = 3
-MAX_WORKERS     = 9
+INTERVAL          = 3
+MAX_WORKERS       = 9
+MAX_LOGIN_RETRIES = 3
 
 TARGET_STATUSES = ["1st Set", "2nd Set", "3rd Set"]
 
@@ -33,6 +35,97 @@ TT_HEADERS = {
     "Priority":        "u=0",
     "Te":              "trailers",
 }
+
+
+# ── DB cookie check ───────────────────────────────────────────────────────────
+def _load_db_config() -> dict:
+    base   = os.path.dirname(os.path.abspath(__file__))
+    config = {}
+    with open(os.path.join(base, "db.txt"), "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                config[key.strip()] = value.strip().strip('"')
+    return config
+
+
+def _get_supabase():
+    from supabase import create_client
+    config = _load_db_config()
+    return create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
+
+
+def _read_cookie() -> str:
+    """Returns the stored cookie string, or '' on empty/missing/DB error."""
+    try:
+        sb  = _get_supabase()
+        row = sb.table("betking").select("cookie").eq("id", 1).single().execute()
+        return (row.data or {}).get("cookie") or ""
+    except Exception as e:
+        print(f"[tracker] cookie check err : {e}")
+        return ""
+
+
+# ── check_can_bet wrapper with login + restart-on-failure ──────────────────────
+async def _check_can_bet_with_login_retry() -> tuple[bool, bool]:
+    """
+    Wraps check_can_bet(). Restarts via login() and retries (up to
+    MAX_LOGIN_RETRIES times) whenever a session/cookie problem is detected —
+    covering three cases:
+      1. The stored cookie is empty/missing before we even call check_can_bet().
+      2. check_can_bet() raises (e.g. a bad/empty cookie response crashing
+         deep inside betlist.py).
+      3. check_can_bet() returns False AND it internally ran its own re-login
+         (betlist.py does this silently on 401/301/expired-session — it logs
+         in but returns False without retrying itself). We detect this by
+         snapshotting the cookie before the call and comparing it after: if
+         the cookie value changed, a re-login happened underneath us and we
+         should retry rather than treat False as a real daily-limit block.
+
+    Returns (can_bet, login_failed):
+      - can_bet:      True if betting is currently allowed
+      - login_failed: True only if retries were exhausted trying to fix the
+                       cookie/login — distinct from a legitimate daily-limit
+                       block, so the caller can exit with the right message.
+    """
+    for attempt in range(1, MAX_LOGIN_RETRIES + 1):
+        cookie_before = _read_cookie()
+
+        if not cookie_before.strip():
+            print(f"[tracker] cookie empty   : running login (attempt {attempt}/{MAX_LOGIN_RETRIES}) ...")
+            try:
+                await login()
+            except Exception as e:
+                print(f"[tracker] login err      : {e}")
+            continue
+
+        try:
+            result = await check_can_bet()
+        except Exception as e:
+            print(f"[tracker] betlist error  : {e}")
+            print(f"[tracker] retrying via login (attempt {attempt}/{MAX_LOGIN_RETRIES}) ...")
+            try:
+                await login()
+            except Exception as login_e:
+                print(f"[tracker] login err      : {login_e}")
+            continue
+
+        if result is False:
+            cookie_after = _read_cookie()
+            if cookie_after.strip() and cookie_after != cookie_before:
+                # betlist.py silently re-logged in underneath us — cookie changed.
+                # Don't trust this False as a real block; retry the check now
+                # that a fresh cookie is in place.
+                print(f"[tracker] session refreshed during check — retrying (attempt {attempt}/{MAX_LOGIN_RETRIES}) ...")
+                continue
+
+        return result, False
+
+    print(f"[tracker] login retries exhausted ({MAX_LOGIN_RETRIES}) — giving up")
+    return False, True
 
 
 # ── Fetch overview ────────────────────────────────────────────────────────────
@@ -82,9 +175,11 @@ def filter_qualifying_events(data: dict) -> list[dict]:
 # ── Betlist check ─────────────────────────────────────────────────────────────
 async def _run_betlist_check(can_bet: list):
     try:
-        result     = await check_can_bet()
+        result, login_failed = await _check_can_bet_with_login_retry()
         can_bet[0] = result
-        if not result:
+        if login_failed:
+            print(f"[tracker] betting halted : cookie/login could not be recovered")
+        elif not result:
             print(f"[tracker] betting halted : daily limit reached — no new workers will be dispatched")
     except Exception as e:
         print(f"[tracker] betlist error  : {e}")
@@ -167,7 +262,11 @@ async def main_async():
 
     print(f"[tracker] startup check  : verifying daily limit ...")
     try:
-        can_bet[0] = await check_can_bet()
+        can_bet[0], login_failed = await _check_can_bet_with_login_retry()
+        if login_failed:
+            print(f"[tracker] startup failed : cookie/login could not be recovered after {MAX_LOGIN_RETRIES} attempts")
+            print(f"[tracker] shutdown complete")
+            return
         if not can_bet[0]:
             print(f"[tracker] betting halted : daily limit already reached at startup")
             print(f"[tracker] shutdown complete")
