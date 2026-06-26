@@ -539,14 +539,29 @@ async def _match_worker(key, bk_fixture_id: int, b9_event_id: str, match_label: 
                     print(f"{tag} arb CLOSED (resumed): {match_label} | {arb['label']} | {duration}s")
                     await _store_arb(match_label, arb, duration)
                 if last_logged_pause_set is not None:
-                    print(f"{tag} {match_label} -- set resumed, waiting for next pause")
+                    # Log odds at set start for analysis
+                    bk_markets_r = parse_betking_event(bk1_raw.get("markets", []), bk2_raw.get("markets", []))
+                    b9_markets_r = parse_bet9ja_event(b9_raw)
+                    print(f"{tag} {match_label} -- SET STARTED | BK: {bk_status} | B9J: {b9_es}")
+                    for mkey in sorted(set(bk_markets_r) & set(b9_markets_r), key=str):
+                        bkm = bk_markets_r[mkey]
+                        b9m = b9_markets_r[mkey]
+                        margin = round(_arb_margin_pct(max(bkm["side_a"], b9m["side_a"]), max(bkm["side_b"], b9m["side_b"])), 2)
+                        print(f"{tag}   {bkm['label']:<35} BK {bkm['side_a']}/{bkm['side_b']} | B9J {b9m['side_a']}/{b9m['side_b']} | margin {margin}%")
                     last_logged_pause_set = None
                 continue
 
-            # Both paused on same set — log once per pause
+            # Both paused on same set — log odds once per pause
             if pause_set != last_logged_pause_set:
                 print(f"{tag} {match_label} -- PAUSE Set {pause_set} | BK: {bk_status} | B9J: {b9_es}")
                 last_logged_pause_set = pause_set
+                bk_markets_p = parse_betking_event(bk1_raw.get("markets", []), bk2_raw.get("markets", []))
+                b9_markets_p = parse_bet9ja_event(b9_raw)
+                for mkey in sorted(set(bk_markets_p) & set(b9_markets_p), key=str):
+                    bkm = bk_markets_p[mkey]
+                    b9m = b9_markets_p[mkey]
+                    margin = round(_arb_margin_pct(max(bkm["side_a"], b9m["side_a"]), max(bkm["side_b"], b9m["side_b"])), 2)
+                    print(f"{tag}   {bkm['label']:<35} BK {bkm['side_a']}/{bkm['side_b']} | B9J {b9m['side_a']}/{b9m['side_b']} | margin {margin}%")
 
             # ── Arb comparison ────────────────────────────────────────────────
             bk_markets = parse_betking_event(bk1_raw.get("markets", []), bk2_raw.get("markets", []))
