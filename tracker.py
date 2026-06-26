@@ -1,45 +1,36 @@
-import httpx
+"""
+tracker.py -- general controller. Runs every registered module on its
+own interval, forever, inside one asyncio event loop.
+
+On startup and every 5 hours, refreshes cookies by running bk_login.py
+and b9_login.py if the wixnation cookie in the DB is older than 5 hours.
+"""
 import asyncio
-import time
-import sys
+import importlib
 import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from module.analyzer import analyze
-from module.betlist  import check_can_bet
-from login            import login
+MODULES = [
+    "module.TT_live",   # TT live match cross-reference -- every 5s
+    # "module.TT_winner",
+    # "module.FB_pmatch",
+]
 
+COOKIE_ACCOUNTS = [
+    {"name": "wixnation",   "script": "b9_login.py"},
+    {"name": "Chukwuebuka", "script": "bk_login.py"},
+]
 
-# ── Config ───────────────
-INTERVAL          = 3
-MAX_WORKERS       = 9
-MAX_LOGIN_RETRIES = 3
-
-TARGET_STATUSES = ["1st Set", "2nd Set", "3rd Set"]
-
-TT_URL = (
-    "https://m.betking.com/en-ng/sports/live/api/overview/20"
-    "?_data=routes%2F%28%24locale%29.sports.live.api.overview.%24sportId"
-)
-
-TT_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-    "Accept":          "*/*",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Referer":         "https://m.betking.com/en-ng/sports/live/table-tennis/20",
-    "Dnt":             "1",
-    "Sec-Gpc":         "1",
-    "Sec-Fetch-Dest":  "empty",
-    "Sec-Fetch-Mode":  "cors",
-    "Sec-Fetch-Site":  "same-origin",
-    "Priority":        "u=0",
-    "Te":              "trailers",
-}
+COOKIE_MAX_AGE_HOURS = 5
+COOKIE_CHECK_INTERVAL = 60 * 60  # re-check every hour
 
 
-# ── DB cookie check ───────────────────────────────────────────────────────────
-def _load_db_config() -> dict:
-    base   = os.path.dirname(os.path.abspath(__file__))
+def _get_supabase():
+    from supabase import create_client
+    base = os.path.dirname(os.path.abspath(__file__))
     config = {}
     with open(os.path.join(base, "db.txt"), "r") as f:
         for line in f:
@@ -47,266 +38,104 @@ def _load_db_config() -> dict:
             if not line or line.startswith("#"):
                 continue
             if "=" in line:
-                key, _, value = line.partition("=")
-                config[key.strip()] = value.strip().strip('"')
-    return config
-
-
-def _get_supabase():
-    from supabase import create_client
-    config = _load_db_config()
+                k, _, v = line.partition("=")
+                config[k.strip()] = v.strip().strip('"')
     return create_client(config["SUPABASE_URL"], config["SUPABASE_KEY"])
 
 
-def _read_cookie() -> str:
-    """Returns the stored cookie string, or '' on empty/missing/DB error."""
+def _cookie_is_stale(account_name: str) -> bool:
+    """Return True if the named account's cookie is older than COOKIE_MAX_AGE_HOURS."""
     try:
-        sb  = _get_supabase()
-        row = sb.table("betking").select("cookie").eq("id", 1).single().execute()
-        return (row.data or {}).get("cookie") or ""
+        sb = _get_supabase()
+        row = (
+            sb.table("betking")
+            .select("created_at")
+            .eq("name", account_name)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not row.data:
+            print(f"[controller] {account_name}: no cookie found — will run login")
+            return True
+
+        created_at_str = row.data[0]["created_at"]
+        created_at = datetime.fromisoformat(created_at_str.replace(" ", "T"))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        age = datetime.now(timezone.utc) - created_at
+        hours_old = age.total_seconds() / 3600
+
+        if hours_old >= COOKIE_MAX_AGE_HOURS:
+            print(f"[controller] {account_name}: cookie age {hours_old:.1f}h — stale, refreshing")
+            return True
+        else:
+            print(f"[controller] {account_name}: cookie age {hours_old:.1f}h — fresh")
+            return False
+
     except Exception as e:
-        print(f"[tracker] cookie check err : {e}")
-        return ""
+        print(f"[controller] {account_name}: age check failed ({e}) — will run login")
+        return True
 
 
-# ── check_can_bet wrapper with login + restart-on-failure ──────────────────────
-async def _check_can_bet_with_login_retry() -> tuple[bool, bool]:
-    """
-    Wraps check_can_bet(). Restarts via login() and retries (up to
-    MAX_LOGIN_RETRIES times) whenever a session/cookie problem is detected —
-    covering three cases:
-      1. The stored cookie is empty/missing before we even call check_can_bet().
-      2. check_can_bet() raises (e.g. a bad/empty cookie response crashing
-         deep inside betlist.py).
-      3. check_can_bet() returns False AND it internally ran its own re-login
-         (betlist.py does this silently on 401/301/expired-session — it logs
-         in but returns False without retrying itself). We detect this by
-         snapshotting the cookie before the call and comparing it after: if
-         the cookie value changed, a re-login happened underneath us and we
-         should retry rather than treat False as a real daily-limit block.
+def _run_login_script(script: str):
+    """Run a login script with live stdout/stderr output."""
+    print(f"[controller] running {script}...")
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-u", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        for line in process.stdout:
+            print(f"  [{script}] {line}", end="")
+        process.wait()
+        if process.returncode == 0:
+            print(f"[controller] {script} completed successfully")
+        else:
+            print(f"[controller] {script} exited with code {process.returncode}")
+    except subprocess.TimeoutExpired:
+        print(f"[controller] {script} timed out after 120s")
+    except FileNotFoundError:
+        print(f"[controller] {script} not found — skipping")
+    except Exception as e:
+        print(f"[controller] {script} error: {e}")
 
-    Returns (can_bet, login_failed):
-      - can_bet:      True if betting is currently allowed
-      - login_failed: True only if retries were exhausted trying to fix the
-                       cookie/login — distinct from a legitimate daily-limit
-                       block, so the caller can exit with the right message.
-    """
-    for attempt in range(1, MAX_LOGIN_RETRIES + 1):
-        cookie_before = _read_cookie()
 
-        if not cookie_before.strip():
-            print(f"[tracker] cookie empty   : running login (attempt {attempt}/{MAX_LOGIN_RETRIES}) ...")
-            try:
-                await login()
-            except Exception as e:
-                print(f"[tracker] login err      : {e}")
-            continue
+async def cookie_refresh_loop():
+    """Check each account's cookie age on startup and every hour; re-login only if stale."""
+    while True:
+        for account in COOKIE_ACCOUNTS:
+            if _cookie_is_stale(account["name"]):
+                _run_login_script(account["script"])
+        await asyncio.sleep(COOKIE_CHECK_INTERVAL)
 
+
+async def run_module_loop(module_name: str):
+    mod = importlib.import_module(module_name)
+    interval = getattr(mod, "INTERVAL_SECONDS", 60)
+    print(f"[controller] starting {module_name} (every {interval}s)")
+
+    while True:
+        start = time.monotonic()
         try:
-            result = await check_can_bet()
+            await mod.run_once()
         except Exception as e:
-            print(f"[tracker] betlist error  : {e}")
-            print(f"[tracker] retrying via login (attempt {attempt}/{MAX_LOGIN_RETRIES}) ...")
-            try:
-                await login()
-            except Exception as login_e:
-                print(f"[tracker] login err      : {login_e}")
-            continue
+            print(f"[controller] {module_name} crashed this cycle: {e}")
 
-        if result is False:
-            cookie_after = _read_cookie()
-            if cookie_after.strip() and cookie_after != cookie_before:
-                # betlist.py silently re-logged in underneath us — cookie changed.
-                # Don't trust this False as a real block; retry the check now
-                # that a fresh cookie is in place.
-                print(f"[tracker] session refreshed during check — retrying (attempt {attempt}/{MAX_LOGIN_RETRIES}) ...")
-                continue
-
-        return result, False
-
-    print(f"[tracker] login retries exhausted ({MAX_LOGIN_RETRIES}) — giving up")
-    return False, True
+        elapsed = time.monotonic() - start
+        sleep_for = max(0, interval - elapsed)
+        await asyncio.sleep(sleep_for)
 
 
-# ── Fetch overview ────────────────────────────────────────────────────────────
-async def fetch_live_events() -> dict | None:
-    async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
-        resp = await client.get(TT_URL, headers=TT_HEADERS)
-    if resp.status_code != 200:
-        print(f"[tracker] fetch failed : HTTP {resp.status_code}")
-        return None
-    if not resp.text or not resp.text.strip():
-        print(f"[tracker] fetch failed : empty response")
-        return None
-    return resp.json()
-
-
-# ── Parse events ──────────────────────────────────────────────────────────────
-def _extract_all_events(data: dict) -> list[dict]:
-    events = []
-    for sport in data.get("sportData", []):
-        for tournament in sport.get("tournaments", []):
-            for event in tournament.get("events", []):
-                events.append({
-                    "id":         event["id"],
-                    "name":       event["name"],
-                    "score":      event.get("score", "?"),
-                    "set_scores": event.get("setScores", ""),
-                    "status":     event.get("matchStatusLabel", ""),
-                    "tournament": tournament.get("name", "?"),
-                })
-    return events
-
-
-def filter_qualifying_events(data: dict) -> list[dict]:
-    all_events = _extract_all_events(data)
-    collected  = []
-    for status in TARGET_STATUSES:
-        if len(collected) >= MAX_WORKERS:
-            break
-        for event in all_events:
-            if len(collected) >= MAX_WORKERS:
-                break
-            if event["status"].lower() == status.lower():
-                collected.append(event)
-    return collected
-
-
-# ── Betlist check ─────────────────────────────────────────────────────────────
-async def _run_betlist_check(can_bet: list):
-    try:
-        result, login_failed = await _check_can_bet_with_login_retry()
-        can_bet[0] = result
-        if login_failed:
-            print(f"[tracker] betting halted : cookie/login could not be recovered")
-        elif not result:
-            print(f"[tracker] betting halted : daily limit reached — no new workers will be dispatched")
-    except Exception as e:
-        print(f"[tracker] betlist error  : {e}")
-
-
-# ── One tracker cycle ─────────────────────────────────────────────────────────
-async def run_once(cycle: int, seen: set, active_workers: set, quiet_cycles: list, can_bet: list):
-    start   = time.time()
-    data    = await fetch_live_events()
-    elapsed = time.time() - start
-
-    if data is None:
-        return
-
-    qualifying = filter_qualifying_events(data)
-    new_events = [
-        e for e in qualifying
-        if e["id"] not in seen and e["id"] not in active_workers
-    ]
-
-    total = sum(
-        len(t.get("events", []))
-        for s in data.get("sportData", [])
-        for t in s.get("tournaments", [])
-    )
-
-    if not new_events:
-        quiet_cycles[0] += 1
-        if quiet_cycles[0] % 10 == 0:
-            print(
-                f"\n[cycle {cycle}] live={total} | qualifying={len(qualifying)} "
-                f"| new=0 | workers={len(active_workers)} | fetch={elapsed:.2f}s"
-                f"  (x{quiet_cycles[0]} quiet cycles)"
-            )
-            print("-" * 55)
-        return
-
-    quiet_cycles[0] = 0
-
-    print(
-        f"\n[cycle {cycle}] live={total} | qualifying={len(qualifying)} "
-        f"| new={len(new_events)} | workers={len(active_workers)} | fetch={elapsed:.2f}s"
-    )
-    print("-" * 55)
-
-    if not can_bet[0]:
-        print(f"[tracker] skipping dispatch : betting halted for today")
-        return
-
-    for e in new_events:
-        print(f"  eventId    : {e['id']}")
-        print(f"  Match      : {e['name']}")
-        print(f"  Sets       : {e['set_scores']}")
-        print(f"  Status     : {e['status']}")
-        print(f"  Tournament : {e['tournament']}")
-        print("  " + "-" * 53)
-        seen.add(e["id"])
-        active_workers.add(e["id"])
-
-    async def worker_wrapper(event: dict):
-        async def on_bet_placed():
-            asyncio.create_task(_run_betlist_check(can_bet))
-        try:
-            await analyze(event_id=event["id"], on_bet_placed=on_bet_placed)
-        finally:
-            active_workers.discard(event["id"])
-            print(f"[tracker] worker released : eventId={event['id']}")
-
-    for e in new_events:
-        asyncio.create_task(worker_wrapper(e))
-
-
-# ── Main loop ─────────────────────────────────────────────────────────────────
-async def main_async():
-    seen           = set()
-    active_workers = set()
-    cycle          = 1
-    quiet_cycles   = [0]
-    can_bet        = [True]
-
-    print(f"[tracker] startup check  : verifying daily limit ...")
-    try:
-        can_bet[0], login_failed = await _check_can_bet_with_login_retry()
-        if login_failed:
-            print(f"[tracker] startup failed : cookie/login could not be recovered after {MAX_LOGIN_RETRIES} attempts")
-            print(f"[tracker] shutdown complete")
-            return
-        if not can_bet[0]:
-            print(f"[tracker] betting halted : daily limit already reached at startup")
-            print(f"[tracker] shutdown complete")
-            return
-    except Exception as e:
-        print(f"[tracker] betlist error  : {e}")
-
-    try:
-        while True:
-            if len(active_workers) >= MAX_WORKERS:
-                print(f"[tracker] all {MAX_WORKERS} workers busy — pausing tracker ...")
-                while len(active_workers) >= MAX_WORKERS:
-                    await asyncio.sleep(1)
-                print(f"[tracker] slot freed — resuming tracker")
-
-            try:
-                await run_once(cycle, seen, active_workers, quiet_cycles, can_bet)
-            except Exception as e:
-                print(f"[tracker] cycle error    : {e}")
-
-            cycle += 1
-
-            if not can_bet[0]:
-                if active_workers:
-                    print(f"[tracker] betting halted : waiting for {len(active_workers)} worker(s) to finish ...")
-                    while active_workers:
-                        await asyncio.sleep(1)
-                print(f"[tracker] betting halted : daily limit reached — exiting")
-                break
-
-            if len(active_workers) < MAX_WORKERS:
-                if quiet_cycles[0] == 0 or quiet_cycles[0] % 10 == 0:
-                    print(f"[tracker] next cycle in {INTERVAL}s ...")
-                await asyncio.sleep(INTERVAL)
-
-    except KeyboardInterrupt:
-        print("\n[tracker] stopped by user")
-    finally:
-        print("[tracker] shutdown complete")
+async def main():
+    tasks = [asyncio.create_task(cookie_refresh_loop())]
+    tasks += [asyncio.create_task(run_module_loop(name)) for name in MODULES]
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    asyncio.run(main())
