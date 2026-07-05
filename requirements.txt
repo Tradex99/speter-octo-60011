@@ -2,3 +2,5 @@ httpx[http2]
 supabase
 playwright
 asyncio
+brotli
+requests

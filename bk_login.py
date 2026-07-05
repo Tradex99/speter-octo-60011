@@ -59,19 +59,57 @@ def _now_timestamp() -> str:
 async def _neutralize_cookie_banner(context) -> None:
     """BetKing's Angular app re-renders #cookiebanner on top of the page
     (e.g. when the login dialog opens), so dismissing it once is a race —
-    it can pop back up right before the next click. Instead, inject a
-    style tag via an init script that runs before any page script on
-    every navigation, permanently disabling pointer events on the banner
-    no matter how many times Angular re-renders it."""
+    it can pop back up right before the next click.
+
+    Previously this injected a <style> tag to set pointer-events: none,
+    but the site's CSP can silently block injected <style> tags from
+    taking effect (the init script itself still runs fine via CDP, but
+    the CSS it renders is subject to the page's style-src policy) —
+    which is why the banner kept intercepting clicks anyway.
+
+    Instead, just remove the element from the DOM outright the moment it
+    appears, and keep watching for it to reappear. DOM removal isn't
+    subject to CSP style restrictions, so this works regardless of policy."""
     await context.add_init_script(
         """
         (() => {
-            const style = document.createElement('style');
-            style.textContent = '#cookiebanner { pointer-events: none !important; }';
-            (document.head || document.documentElement).appendChild(style);
+            const removeBanner = () => {
+                const el = document.getElementById('cookiebanner');
+                if (el) el.remove();
+            };
+            removeBanner();
+            new MutationObserver(removeBanner).observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+            });
         })();
         """
     )
+
+
+async def _strip_cookie_banner(page) -> None:
+    """Belt-and-suspenders: explicitly remove the banner right before a
+    click that matters, in case the MutationObserver hasn't caught a
+    freshly re-rendered banner yet."""
+    try:
+        await page.evaluate(
+            "document.getElementById('cookiebanner')?.remove()"
+        )
+    except Exception:
+        pass
+
+
+async def _click(page, selector: str, timeout: int) -> None:
+    """Click a selector, stripping the cookie banner first. If a normal
+    click still times out (e.g. banner reappeared mid-click), retry once
+    with force=True so Playwright skips the actionability/visibility
+    check entirely rather than getting stuck."""
+    await _strip_cookie_banner(page)
+    try:
+        await page.click(selector, timeout=timeout)
+    except Exception:
+        await _strip_cookie_banner(page)
+        await page.click(selector, timeout=timeout, force=True)
 
 
 async def login() -> bool:
@@ -88,7 +126,7 @@ async def login() -> bool:
         await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
 
         print("[login] clicking sign-in button ...")
-        await page.click(SIGN_IN_BUTTON_SELECTOR, timeout=TIMEOUT)
+        await _click(page, SIGN_IN_BUTTON_SELECTOR, TIMEOUT)
 
         print("[login] waiting for login dialog ...")
         await page.wait_for_selector(LOGIN_FORM_SELECTOR, timeout=TIMEOUT)
@@ -102,7 +140,7 @@ async def login() -> bool:
                 timeout=TIMEOUT,
             ) as resp_info:
                 print("[login] submitting login form ...")
-                await page.click(SUBMIT_BUTTON_SELECTOR, timeout=TIMEOUT)
+                await _click(page, SUBMIT_BUTTON_SELECTOR, TIMEOUT)
             response = await resp_info.value
         except Exception as e:
             print(f"[login] failed     : login request err : {e}")
@@ -132,7 +170,7 @@ async def login() -> bool:
 
     try:
         sb = _get_supabase()
-        sb.table("betking").update({
+        sb.table("cookies").update({
             "cookie":     cookie,
             "created_at": _now_timestamp(),
         }).eq("name", "Chukwuebuka").execute()

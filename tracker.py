@@ -14,9 +14,7 @@ import time
 from datetime import datetime, timezone
 
 MODULES = [
-    "module.TT_live",   # TT live match cross-reference -- every 5s
-    # "module.TT_winner",
-    # "module.FB_pmatch",
+    "module.TN_live",
 ]
 
 COOKIE_ACCOUNTS = [
@@ -48,7 +46,7 @@ def _cookie_is_stale(account_name: str) -> bool:
     try:
         sb = _get_supabase()
         row = (
-            sb.table("betking")
+            sb.table("cookies")
             .select("created_at")
             .eq("name", account_name)
             .order("created_at", desc=True)
@@ -106,12 +104,13 @@ def _run_login_script(script: str):
 
 
 async def cookie_refresh_loop():
-    """Check each account's cookie age on startup and every hour; re-login only if stale."""
+    """Re-check each account's cookie age every hour; re-login only if stale.
+    Startup check is handled synchronously in main() before modules start."""
     while True:
+        await asyncio.sleep(COOKIE_CHECK_INTERVAL)
         for account in COOKIE_ACCOUNTS:
             if _cookie_is_stale(account["name"]):
                 _run_login_script(account["script"])
-        await asyncio.sleep(COOKIE_CHECK_INTERVAL)
 
 
 async def run_module_loop(module_name: str):
@@ -119,11 +118,18 @@ async def run_module_loop(module_name: str):
     interval = getattr(mod, "INTERVAL_SECONDS", 60)
     print(f"[controller] starting {module_name} (every {interval}s)")
 
+    stop_exc = getattr(mod, "StopTrading", None)
+
     while True:
         start = time.monotonic()
         try:
             await mod.run_once()
         except Exception as e:
+            if stop_exc is not None and isinstance(e, stop_exc):
+                print(f"[controller] {module_name} requested a full stop: {e}")
+                if hasattr(mod, "shutdown"):
+                    await mod.shutdown()
+                raise  # propagate so main() tears the whole session down
             print(f"[controller] {module_name} crashed this cycle: {e}")
 
         elapsed = time.monotonic() - start
@@ -132,9 +138,49 @@ async def run_module_loop(module_name: str):
 
 
 async def main():
+    # Step 1: Cookie refresh (runs on startup, blocks until done)
+    for account in COOKIE_ACCOUNTS:
+        if _cookie_is_stale(account["name"]):
+            _run_login_script(account["script"])
+
+    # Step 2: Balance check via TT_betlist — exit entirely if insufficient funds
+    print("[controller] checking account balances before starting...")
+    try:
+        from module.TT_betlist import check_and_wait, NeedRelogin
+        try:
+            can_proceed = await check_and_wait()
+        except NeedRelogin as e:
+            print(f"[controller] ⚠️ {e} — running b9_login.py to refresh cookie")
+            _run_login_script("b9_login.py")
+            try:
+                can_proceed = await check_and_wait(allow_relogin=False)
+            except NeedRelogin:
+                # shouldn't happen with allow_relogin=False, but be safe
+                can_proceed = False
+
+        if not can_proceed:
+            print("[controller] ❌ insufficient balance on both platforms — exiting")
+            return
+        print("[controller] ✅ balance check passed — starting modules")
+    except Exception as e:
+        print(f"[controller] balance check failed: {e} — proceeding anyway")
+
+    # Step 3: Start cookie refresh loop + all modules
+    print("[controller] STARTING -> RUNNING")
     tasks = [asyncio.create_task(cookie_refresh_loop())]
     tasks += [asyncio.create_task(run_module_loop(name)) for name in MODULES]
-    await asyncio.gather(*tasks)
+
+    try:
+        await asyncio.gather(*tasks)
+    except Exception as e:
+  
+        print(f"[controller] RUNNING -> STOPPING ({e})")
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print("[controller] STOPPING -> STOPPED — trading session ended")
 
 
 if __name__ == "__main__":
