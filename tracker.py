@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 
 MODULES = [
-    "module.BB_live",
+    "module.TN_live",
 ]
 
 COOKIE_ACCOUNTS = [
