@@ -19,20 +19,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies and Playwright browsers
+      - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install chromium --with-deps
 
-      - name: Install Xvfb
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-
-      - name: Run tracker.py with Xvfb
+      - name: Run tracker.py
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            timeout 355m python3 -u tracker.py || true
+          timeout 355m python3 -u tracker.py || true
