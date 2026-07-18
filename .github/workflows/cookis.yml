@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies and Playwright browsers
         run: |
-          pip install -r requirements.txt
+          pip install -r requirement.txt
           playwright install chromium --with-deps
 
       - name: Install Xvfb
