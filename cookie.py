@@ -25,7 +25,7 @@ USER_AGENT = (
 COOKIE_NAME = "__test"
 EXCHANGE_NAMES = [
     "binance", "bybit", "bitget", "mexc", "bingx",
-    "kucoin", "coinex", "okx", "weex", "bitmart",
+    "kucoin", "coinex", "okx", "weex", "bitmart", "lbank"
 ]  # matches tracker.py's lowercase exchange_name keys
 
 
