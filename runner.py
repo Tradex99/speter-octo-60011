@@ -3,32 +3,68 @@
 import subprocess
 import sys
 
-# Start tracker.py (hide output)
-tracker = subprocess.Popen(
-    [sys.executable, "tracker.py"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
+# ==========================
+# Enable/Disable scripts
+# ==========================
+RUN_TRACKER = True
+RUN_ANALYZER = True
+RUN_TRADER = True
 
-# Start analyzer.py (hide output)
-analyzer = subprocess.Popen(
-    [sys.executable, "analyzer.py"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
+processes = []
 
-# Start trader.py (show output)
-trader = subprocess.Popen(
-    [sys.executable, "-u", "trader.py"]  # -u = unbuffered output
-)
+
+def start_script(filename, show_output=False):
+    """Start a Python script."""
+
+    if show_output:
+        process = subprocess.Popen(
+            [sys.executable, "-u", filename]  # Unbuffered output
+        )
+    else:
+        process = subprocess.Popen(
+            [sys.executable, filename],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    print(f"✅ {filename} started.")
+    processes.append(process)
+    return process
+
+
+tracker = None
+analyzer = None
+trader = None
+
+if RUN_TRACKER:
+    tracker = start_script("tracker.py")
+
+if RUN_ANALYZER:
+    analyzer = start_script("analyzer.py")
+
+if RUN_TRADER:
+    trader = start_script("trader.py", show_output=True)
 
 try:
-    # Wait until trader.py finishes
-    trader.wait()
-finally:
-    # Stop background scripts when trader exits
-    tracker.terminate()
-    analyzer.terminate()
+    # Wait only for trader if it's running.
+    if trader:
+        trader.wait()
+    else:
+        # If trader is disabled, wait for any enabled process.
+        for process in processes:
+            process.wait()
 
-    tracker.wait()
-    analyzer.wait()
+finally:
+    print("\nStopping background processes...")
+
+    for process in processes:
+        if process.poll() is None:  # Still running
+            process.terminate()
+
+    for process in processes:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    print("All processes stopped.")

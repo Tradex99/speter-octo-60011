@@ -1,3 +1,4 @@
+import time
 import logging
 
 import analyzer as base
@@ -12,7 +13,8 @@ log = logging.getLogger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-MIN_ROI_PCT = 0.001
+MIN_ROI_PCT = 0.1
+CHECK_INTERVAL_SEC = 60
 
 
 def load_all_trade_coins() -> list:
@@ -290,9 +292,7 @@ def update_trade_coins_and_bot_state(*args, **kwargs):
     raise NotImplementedError
 
 
-def main():
-    base.set_exchange_mode('trader')
-
+def run_once():
     rows = load_all_trade_coins()
     total = len(rows)
 
@@ -336,5 +336,21 @@ def main():
     log.info(f"Remaining in trade_coins: {remaining}")
 
 
+def main():
+    base.set_exchange_mode('trader')
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            log.error(f"trader.py: unexpected error in run cycle: {str(e)[:300]}")
+        log.info("")
+        log.info(f"Next check in {CHECK_INTERVAL_SEC}s...")
+        log.info("")
+        time.sleep(CHECK_INTERVAL_SEC)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("trader.py stopped.")
