@@ -23,9 +23,9 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Run tracker.py
+      - name: Run Runner.py
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          timeout 355m python3 -u tracker.py || true
+          timeout 355m python3 -u runner.py || true
