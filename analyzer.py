@@ -922,15 +922,14 @@ def calc_arb_profit(capital_usd, buy_price, sell_price, fee_tokens=None,
     tokens_bought = capital_usd / buy_price
     buy_fee_usd   = capital_usd * buy_taker_rate
 
+    gas_tokens       = fee_tokens if fee_tokens is not None else 0.0
+    tokens_remaining = tokens_bought - gas_tokens
+
     min_withdrawal_met = (
-        tokens_bought >= min_withdrawal_tokens
+        tokens_remaining >= min_withdrawal_tokens
         if min_withdrawal_tokens is not None and min_withdrawal_tokens > 0
         else True
     )
-
-
-    gas_tokens       = fee_tokens if fee_tokens is not None else 0.0
-    tokens_remaining = tokens_bought - gas_tokens
 
 
     gross_sell_usd = tokens_remaining * sell_price if tokens_remaining > 0 else 0.0
