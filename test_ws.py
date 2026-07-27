@@ -1,43 +1,47 @@
 """
-Standalone connection test for Binance's WebSocket API (Spot).
+Standalone connection test for OKX's v5 WebSocket API.
 
 Mirrors the DB-loading pattern used in tracker.py (db.txt -> Supabase
-api_keys table) but targets a row where exchange_name == "binance".
+api_keys table) but targets a row where exchange_name == "okx".
 Only exercises the connection itself:
-  - public WS: connect to a raw stream, confirm market data arrives
-  - private WS: request a listenKey over REST (needs only the API key,
-    no signature), then connect to the user-data stream with it and
-    confirm the connection stays open
+  - public WS: connect + subscribe to one channel, confirm data arrives
+  - private WS: connect + login, confirm the server accepts the signature
 
-Run with:  python binance_ws_test.py
+OKX credentials are a triplet: api_key, api_secret, AND passphrase
+(the passphrase is set by you when the API key was created on OKX —
+it's not something OKX generates, so make sure it's stored too).
+
+Run with:  python okx_ws_test.py
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 import time
 
-import requests
 import websockets
 
 # --- toggle this exactly like DEMO_TRADING in tracker.py ---
-TESTNET = True
+# OKX calls this "demo trading" (paper trading), not "testnet", and it
+# uses a completely different host (wspap) rather than a URL flag.
+DEMO_TRADING = True
 
-REST_BASE = (
-    "https://testnet.binance.vision"
-    if TESTNET
-    else "https://api.binance.com"
+PUBLIC_WS_URL = (
+    "wss://wspap.okx.com:8443/ws/v5/public"
+    if DEMO_TRADING
+    else "wss://ws.okx.com:8443/ws/v5/public"
 )
-PUBLIC_WS_BASE = (
-    "wss://stream.testnet.binance.vision:9443/ws"
-    if TESTNET
-    else "wss://stream.binance.com:9443/ws"
+PRIVATE_WS_URL = (
+    "wss://wspap.okx.com:8443/ws/v5/private"
+    if DEMO_TRADING
+    else "wss://ws.okx.com:8443/ws/v5/private"
 )
 
-LISTEN_KEY_ENDPOINT = f"{REST_BASE}/api/v3/userDataStream"
-
-# A harmless public stream just to prove data flows.
-TEST_PUBLIC_STREAM = "btcusdt@aggTrade"
+# A harmless public channel just to prove data flows.
+TEST_PUBLIC_CHANNEL = {"channel": "tickers", "instId": "BTC-USDT"}
 
 CONNECT_TIMEOUT_SEC = 10
 RESPONSE_WAIT_SEC = 10
@@ -74,13 +78,11 @@ def _clean_secret(value):
     return value
 
 
-def load_binance_credentials() -> dict:
+def load_okx_credentials() -> dict:
     """Same shape as tracker.py's load_bitmart_credentials(), but looks
-    for the 'binance' row in the api_keys Supabase table.
-
-    api_secret is loaded for completeness (signed REST calls need it
-    later) but this connection test only needs api_key — creating a
-    listenKey is authenticated by API key alone, no signature."""
+    for the 'okx' row in the api_keys Supabase table. OKX needs a
+    passphrase in addition to key/secret, so that column has to be
+    populated in the table for this to work."""
     from supabase import create_client
 
     config = _load_db_config()
@@ -88,65 +90,89 @@ def load_binance_credentials() -> dict:
 
     rows = sb.table("api_keys").select("*").execute()
     match = next(
-        (r for r in rows.data or [] if (r.get("exchange_name") or "").strip().lower() == "binance"),
+        (r for r in rows.data or [] if (r.get("exchange_name") or "").strip().lower() == "okx"),
         None,
     )
     if not match:
-        raise RuntimeError("No 'binance' row found in the api_keys Supabase table")
+        raise RuntimeError("No 'okx' row found in the api_keys Supabase table")
 
     api_key = _clean_secret(match.get("api_key"))
     api_secret = _clean_secret(match.get("api_secret"))
+    passphrase = _clean_secret(match.get("memo") or match.get("passphrase"))
 
-    if not api_key:
-        raise RuntimeError("Binance credentials incomplete in Supabase — missing: api_key")
+    missing = [n for n, v in (("api_key", api_key), ("api_secret", api_secret), ("passphrase", passphrase)) if not v]
+    if missing:
+        raise RuntimeError(f"OKX credentials incomplete in Supabase — missing: {', '.join(missing)}")
 
-    return {"api_key": api_key, "api_secret": api_secret}
+    return {"api_key": api_key, "api_secret": api_secret, "passphrase": passphrase}
+
+
+def build_login_args(api_key: str, api_secret: str, passphrase: str) -> dict:
+    timestamp = str(int(time.time()))
+    message = f"{timestamp}GET/users/self/verify"
+    sign = base64.b64encode(
+        hmac.new(api_secret.encode(), message.encode(), hashlib.sha256).digest()
+    ).decode()
+    return {"apiKey": api_key, "passphrase": passphrase, "timestamp": timestamp, "sign": sign}
 
 
 async def test_public_ws():
-    url = f"{PUBLIC_WS_BASE}/{TEST_PUBLIC_STREAM}"
-    print(f"[public] connecting to {url}")
-    async with websockets.connect(url, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
-        print("[public] connected — waiting for a tick")
-        try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=RESPONSE_WAIT_SEC)
-        except asyncio.TimeoutError:
+    print(f"[public] connecting to {PUBLIC_WS_URL}")
+    async with websockets.connect(PUBLIC_WS_URL, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
+        print("[public] connected — subscribing to", TEST_PUBLIC_CHANNEL)
+        await ws.send(json.dumps({"op": "subscribe", "args": [TEST_PUBLIC_CHANNEL]}))
+
+        saw_ack = False
+        saw_data = False
+        deadline = time.time() + RESPONSE_WAIT_SEC
+        while time.time() < deadline and not (saw_ack and saw_data):
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=deadline - time.time())
+            except asyncio.TimeoutError:
+                break
+            msg = json.loads(raw)
+            if msg.get("event") == "subscribe":
+                saw_ack = True
+                print(f"[public] subscribe ack: {msg}")
+            elif msg.get("event") == "error":
+                print(f"[public] subscribe error: {msg}")
+                break
+            elif "data" in msg and msg.get("arg", {}).get("channel") == TEST_PUBLIC_CHANNEL["channel"]:
+                saw_data = True
+                print("[public] received channel data — connection confirmed")
+
+        if not saw_ack:
+            print("[public] WARNING: no subscribe ack received within timeout")
+        if not saw_data:
             print("[public] WARNING: no market data received within timeout")
-            return
-        msg = json.loads(raw)
-        print(f"[public] received {msg.get('e', 'message')} for {msg.get('s', '?')} — connection confirmed")
-
-
-def create_listen_key(api_key: str) -> str:
-    resp = requests.post(
-        LISTEN_KEY_ENDPOINT,
-        headers={"X-MBX-APIKEY": api_key},
-        timeout=CONNECT_TIMEOUT_SEC,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"listenKey request failed: {resp.status_code} {resp.text[:300]}")
-    return resp.json()["listenKey"]
 
 
 async def test_private_ws(creds: dict):
-    print("[private] requesting listenKey")
-    listen_key = create_listen_key(creds["api_key"])
-    print("[private] listenKey obtained")
+    print(f"[private] connecting to {PRIVATE_WS_URL}")
+    async with websockets.connect(PRIVATE_WS_URL, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
+        login_args = build_login_args(creds["api_key"], creds["api_secret"], creds["passphrase"])
+        print("[private] connected — sending login")
+        await ws.send(json.dumps({"op": "login", "args": [login_args]}))
 
-    url = f"{PUBLIC_WS_BASE}/{listen_key}"
-    print(f"[private] connecting to {url}")
-    async with websockets.connect(url, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
-        print("[private] \u2705 connected — user-data stream is live (no auth message needed; the listenKey is the credential)")
-        # Nothing will arrive unless the account has activity, so just
-        # confirm the socket stays open rather than waiting on a message.
-        await asyncio.sleep(2)
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=RESPONSE_WAIT_SEC)
+        except asyncio.TimeoutError:
+            print("[private] WARNING: no login response received within timeout")
+            return
+
+        msg = json.loads(raw)
+        if msg.get("event") == "login" and msg.get("code") == "0":
+            print(f"[private] \u2705 login successful — {msg}")
+        else:
+            print(f"[private] \u274c login failed — {msg}")
+            print("[private] if this key requires IP whitelisting, confirm this machine's outbound IP is whitelisted on OKX")
 
 
 async def main():
-    print(f"Binance WS connection test (testnet={TESTNET})")
+    print(f"OKX WS connection test (demo_trading={DEMO_TRADING})")
     await test_public_ws()
 
-    creds = load_binance_credentials()
+    creds = load_okx_credentials()
     await test_private_ws(creds)
 
 
