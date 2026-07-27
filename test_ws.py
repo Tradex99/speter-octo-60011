@@ -27,7 +27,7 @@ import websockets
 # --- toggle this exactly like DEMO_TRADING in tracker.py ---
 # OKX calls this "demo trading" (paper trading), not "testnet", and it
 # uses a completely different host (wspap) rather than a URL flag.
-DEMO_TRADING = True
+DEMO_TRADING = False
 
 PUBLIC_WS_URL = (
     "wss://wspap.okx.com:8443/ws/v5/public"
