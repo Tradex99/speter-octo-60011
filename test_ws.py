@@ -96,8 +96,8 @@ def load_okx_credentials() -> dict:
     if not match:
         raise RuntimeError("No 'okx' row found in the api_keys Supabase table")
 
-    api_key = _clean_secret(match.get("api_key"))
-    api_secret = _clean_secret(match.get("api_secret"))
+    api_key = _clean_secret(match.get("api_key_demo"))
+    api_secret = _clean_secret(match.get("api_secret_demo"))
     passphrase = _clean_secret(match.get("passphrase"))
 
     missing = [n for n, v in (("api_key", api_key), ("api_secret", api_secret), ("passphrase", passphrase)) if not v]
