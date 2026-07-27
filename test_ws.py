@@ -1,40 +1,43 @@
 """
-Standalone connection test for Bybit's v5 WebSocket API.
+Standalone connection test for Binance's WebSocket API (Spot).
 
 Mirrors the DB-loading pattern used in tracker.py (db.txt -> Supabase
-api_keys table) but targets a row where exchange_name == "bybit".
+api_keys table) but targets a row where exchange_name == "binance".
 Only exercises the connection itself:
-  - public WS: connect + subscribe to one topic, confirm data arrives
-  - private WS: connect + auth, confirm the server accepts the signature
+  - public WS: connect to a raw stream, confirm market data arrives
+  - private WS: request a listenKey over REST (needs only the API key,
+    no signature), then connect to the user-data stream with it and
+    confirm the connection stays open
 
-Run with:  python bybit_ws_test.py
+Run with:  python binance_ws_test.py
 """
 
 import asyncio
-import hmac
-import hashlib
 import json
 import os
 import time
 
+import requests
 import websockets
 
 # --- toggle this exactly like DEMO_TRADING in tracker.py ---
 TESTNET = True
 
-PUBLIC_WS_URL = (
-    "wss://stream-testnet.bybit.com/v5/public/linear"
+REST_BASE = (
+    "https://testnet.binance.vision"
     if TESTNET
-    else "wss://stream.bybit.com/v5/public/linear"
+    else "https://api.binance.com"
 )
-PRIVATE_WS_URL = (
-    "wss://stream-testnet.bybit.com/v5/private"
+PUBLIC_WS_BASE = (
+    "wss://stream.testnet.binance.vision:9443/ws"
     if TESTNET
-    else "wss://stream.bybit.com/v5/private"
+    else "wss://stream.binance.com:9443/ws"
 )
 
-# A harmless public topic just to prove data flows.
-TEST_PUBLIC_TOPIC = "orderbook.1.BTCUSDT"
+LISTEN_KEY_ENDPOINT = f"{REST_BASE}/api/v3/userDataStream"
+
+# A harmless public stream just to prove data flows.
+TEST_PUBLIC_STREAM = "btcusdt@aggTrade"
 
 CONNECT_TIMEOUT_SEC = 10
 RESPONSE_WAIT_SEC = 10
@@ -71,9 +74,13 @@ def _clean_secret(value):
     return value
 
 
-def load_bybit_credentials() -> dict:
+def load_binance_credentials() -> dict:
     """Same shape as tracker.py's load_bitmart_credentials(), but looks
-    for the 'bybit' row in the api_keys Supabase table."""
+    for the 'binance' row in the api_keys Supabase table.
+
+    api_secret is loaded for completeness (signed REST calls need it
+    later) but this connection test only needs api_key — creating a
+    listenKey is authenticated by API key alone, no signature."""
     from supabase import create_client
 
     config = _load_db_config()
@@ -81,83 +88,65 @@ def load_bybit_credentials() -> dict:
 
     rows = sb.table("api_keys").select("*").execute()
     match = next(
-        (r for r in rows.data or [] if (r.get("exchange_name") or "").strip().lower() == "bybit"),
+        (r for r in rows.data or [] if (r.get("exchange_name") or "").strip().lower() == "binance"),
         None,
     )
     if not match:
-        raise RuntimeError("No 'bybit' row found in the api_keys Supabase table")
+        raise RuntimeError("No 'binance' row found in the api_keys Supabase table")
 
     api_key = _clean_secret(match.get("api_key"))
     api_secret = _clean_secret(match.get("api_secret"))
 
-    missing = [n for n, v in (("api_key", api_key), ("api_secret", api_secret)) if not v]
-    if missing:
-        raise RuntimeError(f"Bybit credentials incomplete in Supabase — missing: {', '.join(missing)}")
+    if not api_key:
+        raise RuntimeError("Binance credentials incomplete in Supabase — missing: api_key")
 
     return {"api_key": api_key, "api_secret": api_secret}
 
 
-def build_ws_auth_signature(api_secret: str, expires_ms: int) -> str:
-    payload = f"GET/realtime{expires_ms}"
-    return hmac.new(api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
-
 async def test_public_ws():
-    print(f"[public] connecting to {PUBLIC_WS_URL}")
-    async with websockets.connect(PUBLIC_WS_URL, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
-        print("[public] connected — subscribing to", TEST_PUBLIC_TOPIC)
-        await ws.send(json.dumps({"op": "subscribe", "args": [TEST_PUBLIC_TOPIC]}))
-
-        saw_ack = False
-        saw_data = False
-        deadline = time.time() + RESPONSE_WAIT_SEC
-        while time.time() < deadline and not (saw_ack and saw_data):
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=deadline - time.time())
-            except asyncio.TimeoutError:
-                break
-            msg = json.loads(raw)
-            if msg.get("op") == "subscribe":
-                saw_ack = True
-                print(f"[public] subscribe ack: success={msg.get('success')} ret_msg={msg.get('ret_msg')}")
-            elif msg.get("topic") == TEST_PUBLIC_TOPIC:
-                saw_data = True
-                print(f"[public] received topic data (type={msg.get('type')}) — connection confirmed")
-
-        if not saw_ack:
-            print("[public] WARNING: no subscribe ack received within timeout")
-        if not saw_data:
-            print("[public] WARNING: no market data received within timeout")
-
-
-async def test_private_ws(creds: dict):
-    print(f"[private] connecting to {PRIVATE_WS_URL}")
-    async with websockets.connect(PRIVATE_WS_URL, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
-        expires_ms = int((time.time() + 10) * 1000)
-        sign = build_ws_auth_signature(creds["api_secret"], expires_ms)
-        auth_msg = {"op": "auth", "args": [creds["api_key"], expires_ms, sign]}
-        print("[private] connected — sending auth")
-        await ws.send(json.dumps(auth_msg))
-
+    url = f"{PUBLIC_WS_BASE}/{TEST_PUBLIC_STREAM}"
+    print(f"[public] connecting to {url}")
+    async with websockets.connect(url, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
+        print("[public] connected — waiting for a tick")
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=RESPONSE_WAIT_SEC)
         except asyncio.TimeoutError:
-            print("[private] WARNING: no auth response received within timeout")
+            print("[public] WARNING: no market data received within timeout")
             return
-
         msg = json.loads(raw)
-        if msg.get("op") == "auth" and (msg.get("success") or msg.get("retCode") == 0):
-            print(f"[private] \u2705 auth successful — {msg}")
-        else:
-            print(f"[private] \u274c auth failed — {msg}")
-            print("[private] if this key requires IP whitelisting, confirm this machine's outbound IP is whitelisted on Bybit")
+        print(f"[public] received {msg.get('e', 'message')} for {msg.get('s', '?')} — connection confirmed")
+
+
+def create_listen_key(api_key: str) -> str:
+    resp = requests.post(
+        LISTEN_KEY_ENDPOINT,
+        headers={"X-MBX-APIKEY": api_key},
+        timeout=CONNECT_TIMEOUT_SEC,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"listenKey request failed: {resp.status_code} {resp.text[:300]}")
+    return resp.json()["listenKey"]
+
+
+async def test_private_ws(creds: dict):
+    print("[private] requesting listenKey")
+    listen_key = create_listen_key(creds["api_key"])
+    print("[private] listenKey obtained")
+
+    url = f"{PUBLIC_WS_BASE}/{listen_key}"
+    print(f"[private] connecting to {url}")
+    async with websockets.connect(url, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
+        print("[private] \u2705 connected — user-data stream is live (no auth message needed; the listenKey is the credential)")
+        # Nothing will arrive unless the account has activity, so just
+        # confirm the socket stays open rather than waiting on a message.
+        await asyncio.sleep(2)
 
 
 async def main():
-    print(f"Bybit WS connection test (testnet={TESTNET})")
+    print(f"Binance WS connection test (testnet={TESTNET})")
     await test_public_ws()
 
-    creds = load_bybit_credentials()
+    creds = load_binance_credentials()
     await test_private_ws(creds)
 
 
