@@ -98,7 +98,7 @@ def load_okx_credentials() -> dict:
 
     api_key = _clean_secret(match.get("api_key"))
     api_secret = _clean_secret(match.get("api_secret"))
-    passphrase = _clean_secret(match.get("memo") or match.get("passphrase"))
+    passphrase = _clean_secret(match.get("passphrase"))
 
     missing = [n for n, v in (("api_key", api_key), ("api_secret", api_secret), ("passphrase", passphrase)) if not v]
     if missing:
