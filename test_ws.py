@@ -20,11 +20,13 @@ Run with:  python test_ws.py
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import hmac
 import json
 import os
 import time
+import uuid
 
 import websockets
 
@@ -58,6 +60,9 @@ SYMBOL_MAP = {
     "coinbase": "BTC-USD",    # Coinbase has no USDT spot pair for BTC
     "kraken": "BTC/USD",
     "mexc": "BTC_USDT",       # MEXC contract (futures) symbol format
+    "bitget": "BTCUSDT",      # Bitget USDT-FUTURES symbol format
+    "gateio": "BTC_USDT",     # Gate.io futures contract symbol format
+    "bingx": "BTC-USDT",      # BingX swap (perpetual) symbol format
 }
 
 
@@ -229,13 +234,97 @@ async def test_mexc_public():
     return await _time_to_first_message("mexc", url, payload, is_data)
 
 
+async def test_bitget_public():
+    # Bitget v2 public feed, USDT-margined futures ticker channel.
+    url = "wss://ws.bitget.com/v2/ws/public"
+    payload = {"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "ticker", "instId": SYMBOL_MAP["bitget"]}]}
+
+    def is_data(msg):
+        return msg.get("arg", {}).get("channel") == "ticker" and msg.get("action") in ("snapshot", "update") and "data" in msg
+
+    return await _time_to_first_message("bitget", url, payload, is_data)
+
+
+async def test_gateio_public():
+    # Gate.io futures (USDT-settled) public feed, tickers channel.
+    url = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+    payload = {"time": int(time.time()), "channel": "futures.tickers", "event": "subscribe", "payload": [SYMBOL_MAP["gateio"]]}
+
+    def is_data(msg):
+        return msg.get("channel") == "futures.tickers" and msg.get("event") == "update" and "result" in msg
+
+    return await _time_to_first_message("gateio", url, payload, is_data)
+
+
+async def test_bingx_public():
+    # BingX's swap (perpetual futures) market feed sends gzip-compressed
+    # BINARY frames (unlike every other exchange here, which sends plain
+    # JSON text) and expects a literal "Pong" text reply whenever it sends
+    # a literal "Ping" text frame -- doesn't fit the shared text-message
+    # skeleton, so it gets its own function.
+    name = "bingx"
+    url = "wss://open-api-swap.bingx.com/swap-market"
+    payload = {"id": str(uuid.uuid4()), "reqType": "sub", "dataType": f"{SYMBOL_MAP['bingx']}@ticker"}
+
+    result = ExchangeWSResult(name)
+    start = time.time()
+    try:
+        async with websockets.connect(url, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
+            result.connected = True
+            print(f"[{name}] connected to {url}")
+
+            await ws.send(json.dumps(payload))
+            result.subscribed = True
+            print(f"[{name}] sent subscribe request")
+
+            deadline = time.time() + MESSAGE_TIMEOUT_SEC
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=deadline - time.time())
+                except asyncio.TimeoutError:
+                    break
+
+                if isinstance(raw, (bytes, bytearray)):
+                    try:
+                        text = gzip.decompress(raw).decode("utf-8")
+                    except OSError:
+                        continue  # not a gzip frame -- ignore and keep waiting
+                else:
+                    text = raw
+
+                if text == "Ping":
+                    await ws.send("Pong")
+                    continue
+
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+
+                if "data" in msg and str(msg.get("dataType", "")).endswith("@ticker"):
+                    result.received_message = True
+                    result.latency_sec = time.time() - start
+                    print(f"[{name}] \u2705 received live data after {result.latency_sec:.2f}s")
+                    break
+
+            if not result.received_message:
+                print(f"[{name}] WARNING: connected but no data message within {MESSAGE_TIMEOUT_SEC}s")
+
+    except Exception as e:
+        result.error = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[{name}] \u274c connection failed: {result.error}")
+
+    return result
+
+
 async def run_public_exchange_checks() -> bool:
-    print("Testing public WebSocket connectivity for: OKX, Coinbase, Kraken, MEXC")
+    print("Testing public WebSocket connectivity for: OKX, Coinbase, Kraken, MEXC, Bitget, Gate.io, BingX")
     print(f"Test symbol per exchange: {SYMBOL_MAP}")
     print("No API keys, no authentication, no orders -- public market data only.\n")
 
     results = await asyncio.gather(
         test_okx_public(), test_coinbase_public(), test_kraken_public(), test_mexc_public(),
+        test_bitget_public(), test_gateio_public(), test_bingx_public(),
         return_exceptions=True,
     )
 
