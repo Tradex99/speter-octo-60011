@@ -1,17 +1,21 @@
 """
-Standalone connection test for OKX's v5 WebSocket API.
+Standalone WebSocket connection test covering two things:
 
-Mirrors the DB-loading pattern used in tracker.py (db.txt -> Supabase
-api_keys table) but targets a row where exchange_name == "okx".
-Only exercises the connection itself:
-  - public WS: connect + subscribe to one channel, confirm data arrives
-  - private WS: connect + login, confirm the server accepts the signature
+1. OKX -- the only exchange the bot actually trades on:
+     - public WS:  connect + subscribe to a ticker channel, confirm data arrives
+     - private WS: connect + login, confirm the server accepts the signature
+   Mirrors the DB-loading pattern used in tracker.py (db.txt -> Supabase
+   api_keys table), looking for the row where exchange_name == "okx".
+   OKX credentials are a triplet: api_key, api_secret, AND passphrase
+   (the passphrase is set by you when the API key was created on OKX --
+   it's not something OKX generates, so make sure it's stored too).
 
-OKX credentials are a triplet: api_key, api_secret, AND passphrase
-(the passphrase is set by you when the API key was created on OKX —
-it's not something OKX generates, so make sure it's stored too).
+2. Coinbase, Kraken, MEXC -- public market-data feeds only, no auth, no
+   orders. These back the multi-exchange confirmation layer in
+   cross_exchange_validator.py (not yet built). Each is subscribed for
+   BTC and checked for a real data message, not just a subscribe ack.
 
-Run with:  python okx_ws_test.py
+Run with:  python test_ws.py
 """
 
 import asyncio
@@ -24,27 +28,37 @@ import time
 
 import websockets
 
-# --- toggle this exactly like DEMO_TRADING in tracker.py ---
+# --- toggle this exactly like DEMO_TRADING in tracker.py (OKX only --
+# Coinbase/Kraken/MEXC public feeds have no demo/live distinction) ---
 # OKX calls this "demo trading" (paper trading), not "testnet", and it
 # uses a completely different host (wspap) rather than a URL flag.
 DEMO_TRADING = True
 
-PUBLIC_WS_URL = (
+OKX_PUBLIC_WS_URL = (
     "wss://wspap.okx.com:8443/ws/v5/public"
     if DEMO_TRADING
     else "wss://ws.okx.com:8443/ws/v5/public"
 )
-PRIVATE_WS_URL = (
+OKX_PRIVATE_WS_URL = (
     "wss://wspap.okx.com:8443/ws/v5/private"
     if DEMO_TRADING
     else "wss://ws.okx.com:8443/ws/v5/private"
 )
 
-# A harmless public channel just to prove data flows.
-TEST_PUBLIC_CHANNEL = {"channel": "tickers", "instId": "BTC-USDT"}
-
 CONNECT_TIMEOUT_SEC = 10
-RESPONSE_WAIT_SEC = 10
+RESPONSE_WAIT_SEC = 10       # used by the OKX private login check
+MESSAGE_TIMEOUT_SEC = 15     # used by the public multi-exchange checks
+
+# One symbol per exchange, all mapping to the same underlying market
+# (BTC vs. USD/USDT). OKX uses the swap instrument the bot actually
+# trades; cross_exchange_validator.py will need a fuller version of this
+# mapping for every symbol it evaluates.
+SYMBOL_MAP = {
+    "okx": "BTC-USDT-SWAP",
+    "coinbase": "BTC-USD",    # Coinbase has no USDT spot pair for BTC
+    "kraken": "BTC/USD",
+    "mexc": "BTC_USDT",       # MEXC contract (futures) symbol format
+}
 
 
 def _load_db_config() -> dict:
@@ -116,40 +130,141 @@ def build_login_args(api_key: str, api_secret: str, passphrase: str) -> dict:
     return {"apiKey": api_key, "passphrase": passphrase, "timestamp": timestamp, "sign": sign}
 
 
-async def test_public_ws():
-    print(f"[public] connecting to {PUBLIC_WS_URL}")
-    async with websockets.connect(PUBLIC_WS_URL, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
-        print("[public] connected — subscribing to", TEST_PUBLIC_CHANNEL)
-        await ws.send(json.dumps({"op": "subscribe", "args": [TEST_PUBLIC_CHANNEL]}))
+# ---------------------------------------------------------------------------
+# Public multi-exchange connectivity checks (OKX, Coinbase, Kraken, MEXC)
+# ---------------------------------------------------------------------------
 
-        saw_ack = False
-        saw_data = False
-        deadline = time.time() + RESPONSE_WAIT_SEC
-        while time.time() < deadline and not (saw_ack and saw_data):
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=deadline - time.time())
-            except asyncio.TimeoutError:
-                break
-            msg = json.loads(raw)
-            if msg.get("event") == "subscribe":
-                saw_ack = True
-                print(f"[public] subscribe ack: {msg}")
-            elif msg.get("event") == "error":
-                print(f"[public] subscribe error: {msg}")
-                break
-            elif "data" in msg and msg.get("arg", {}).get("channel") == TEST_PUBLIC_CHANNEL["channel"]:
-                saw_data = True
-                print("[public] received channel data — connection confirmed")
+class ExchangeWSResult:
+    def __init__(self, name):
+        self.name = name
+        self.connected = False
+        self.subscribed = False
+        self.received_message = False
+        self.error = None
+        self.latency_sec = None
 
-        if not saw_ack:
-            print("[public] WARNING: no subscribe ack received within timeout")
-        if not saw_data:
-            print("[public] WARNING: no market data received within timeout")
 
+async def _time_to_first_message(name, url, subscribe_payload, is_data_message):
+    """Shared skeleton: connect, subscribe, wait for the first message that
+    looks like real market data (not just a subscribe ack), then close."""
+    result = ExchangeWSResult(name)
+    start = time.time()
+    try:
+        async with websockets.connect(url, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
+            result.connected = True
+            print(f"[{name}] connected to {url}")
+
+            await ws.send(json.dumps(subscribe_payload))
+            result.subscribed = True
+            print(f"[{name}] sent subscribe request")
+
+            deadline = time.time() + MESSAGE_TIMEOUT_SEC
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=deadline - time.time())
+                except asyncio.TimeoutError:
+                    break
+
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                if is_data_message(msg):
+                    result.received_message = True
+                    result.latency_sec = time.time() - start
+                    print(f"[{name}] \u2705 received live data after {result.latency_sec:.2f}s")
+                    break
+
+            if not result.received_message:
+                print(f"[{name}] WARNING: connected but no data message within {MESSAGE_TIMEOUT_SEC}s")
+
+    except Exception as e:
+        result.error = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[{name}] \u274c connection failed: {result.error}")
+
+    return result
+
+
+async def test_okx_public():
+    payload = {"op": "subscribe", "args": [{"channel": "tickers", "instId": SYMBOL_MAP["okx"]}]}
+
+    def is_data(msg):
+        return msg.get("arg", {}).get("channel") == "tickers" and "data" in msg
+
+    return await _time_to_first_message("okx", OKX_PUBLIC_WS_URL, payload, is_data)
+
+
+async def test_coinbase_public():
+    # Public "Exchange" feed -- ticker channel needs no auth.
+    url = "wss://ws-feed.exchange.coinbase.com"
+    payload = {"type": "subscribe", "product_ids": [SYMBOL_MAP["coinbase"]], "channels": ["ticker"]}
+
+    def is_data(msg):
+        return msg.get("type") == "ticker"
+
+    return await _time_to_first_message("coinbase", url, payload, is_data)
+
+
+async def test_kraken_public():
+    # Kraken WS API v2, public ticker channel.
+    url = "wss://ws.kraken.com/v2"
+    payload = {"method": "subscribe", "params": {"channel": "ticker", "symbol": [SYMBOL_MAP["kraken"]]}}
+
+    def is_data(msg):
+        return msg.get("channel") == "ticker" and msg.get("type") in ("snapshot", "update")
+
+    return await _time_to_first_message("kraken", url, payload, is_data)
+
+
+async def test_mexc_public():
+    # MEXC contract (futures) public feed -- matches perpetual-swap data,
+    # not the spot feed, since that's what a futures cross-check needs.
+    url = "wss://contract.mexc.com/edge"
+    payload = {"method": "sub.ticker", "param": {"symbol": SYMBOL_MAP["mexc"]}}
+
+    def is_data(msg):
+        return msg.get("channel") == "push.ticker" and "data" in msg
+
+    return await _time_to_first_message("mexc", url, payload, is_data)
+
+
+async def run_public_exchange_checks() -> bool:
+    print("Testing public WebSocket connectivity for: OKX, Coinbase, Kraken, MEXC")
+    print(f"Test symbol per exchange: {SYMBOL_MAP}")
+    print("No API keys, no authentication, no orders -- public market data only.\n")
+
+    results = await asyncio.gather(
+        test_okx_public(), test_coinbase_public(), test_kraken_public(), test_mexc_public(),
+        return_exceptions=True,
+    )
+
+    print("\n" + "=" * 60)
+    print("PUBLIC MARKET DATA WEBSOCKET SUMMARY")
+    print("=" * 60)
+    all_ok = True
+    for r in results:
+        if isinstance(r, Exception):
+            print(f"UNKNOWN    FAIL     crashed: {r}")
+            all_ok = False
+            continue
+        status = "PASS" if r.received_message else "FAIL"
+        if not r.received_message:
+            all_ok = False
+        detail = r.error or (f"{r.latency_sec:.2f}s to first tick" if r.received_message else "no data received")
+        print(f"{r.name.upper():10s} {status:6s} {detail}")
+    print("=" * 60 + "\n")
+    return all_ok
+
+
+# ---------------------------------------------------------------------------
+# OKX private (authenticated) check -- OKX only, since it's the only
+# exchange the bot ever sends orders to.
+# ---------------------------------------------------------------------------
 
 async def test_private_ws(creds: dict):
-    print(f"[private] connecting to {PRIVATE_WS_URL}")
-    async with websockets.connect(PRIVATE_WS_URL, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
+    print(f"[private] connecting to {OKX_PRIVATE_WS_URL}")
+    async with websockets.connect(OKX_PRIVATE_WS_URL, open_timeout=CONNECT_TIMEOUT_SEC) as ws:
         login_args = build_login_args(creds["api_key"], creds["api_secret"], creds["passphrase"])
         print("[private] connected — sending login")
         await ws.send(json.dumps({"op": "login", "args": [login_args]}))
@@ -169,11 +284,15 @@ async def test_private_ws(creds: dict):
 
 
 async def main():
-    print(f"OKX WS connection test (demo_trading={DEMO_TRADING})")
-    await test_public_ws()
+    print(f"WebSocket connectivity test (OKX demo_trading={DEMO_TRADING})\n")
+
+    all_public_ok = await run_public_exchange_checks()
 
     creds = load_okx_credentials()
     await test_private_ws(creds)
+
+    if not all_public_ok:
+        print("\nOne or more public data feeds failed -- resolve before building cross_exchange_validator.py on top of them.")
 
 
 if __name__ == "__main__":
