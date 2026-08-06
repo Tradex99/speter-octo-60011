@@ -1,0 +1,7 @@
+Outbound IP for this machine: 105.112.113.231
+Starting OKX Futures bot (demo_trading=True)
+okx_futures.py stopped.
+Outbound IP for this machine: 105.112.113.231
+Starting OKX Futures bot (demo_trading=True)
+[okx-api] GET /api/v5/public/instruments attempt 1/3 failed: ReadTimeout: HTTPSConnectionPool(host='www.okx.com', port=443): Read timed out. (read timeout=10.0)
+okx_futures.py stopped.
