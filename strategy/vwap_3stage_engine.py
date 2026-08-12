@@ -261,7 +261,7 @@ class Vwap3StageConfig:
     symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: DEFAULT_SYMBOL_WHITELIST)
 
     vwap_far_threshold_pct: float = 0.005
-    vwap_near_threshold_pct: float = 0.0010
+    vwap_near_threshold_pct: float = 0.0020
 
     swing_lookback: int = 20
     swing_proximity_pct: float = 0.002
