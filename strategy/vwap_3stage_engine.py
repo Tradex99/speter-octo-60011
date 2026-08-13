@@ -746,6 +746,13 @@ class Vwap3StageEngine(StrategyEngine):
             candidate.direction = ""
             return None
 
+        if market_structure == "UNCLEAR":
+            # Not enough completed 5m candles/swings yet to read structure at
+            # all. That's different from a genuine RANGE read -- "we don't
+            # know" must never silently pass as "no headwind."
+            candidate.direction = ""
+            return None
+
         direction = "short"
         pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
         volume = compute_volume_expansion_strength(
@@ -831,6 +838,12 @@ class Vwap3StageEngine(StrategyEngine):
 
         proximity_pct = abs(price - swing_low) / swing_low
         if proximity_pct >= cfg.swing_proximity_pct:
+            candidate.direction = ""
+            return None
+
+        if market_structure == "UNCLEAR":
+            # Same reasoning as Engine 1: insufficient structure data must
+            # never be treated as "no headwind" -- don't trade blind.
             candidate.direction = ""
             return None
 
