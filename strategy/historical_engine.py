@@ -1,7 +1,7 @@
 """
-historical_engine.py — 3-candle pattern strategy (5-minute candles).
+historical_engine.py — 3‑candle pattern strategy (5‑minute candles).
 
-Compares the latest three completed 5-minute candles against historical patterns
+Compares the latest three completed 5‑minute candles against historical patterns
 (~1 year) and emits a LONG/SHORT signal if at least 70% of similar historical
 patterns were followed by a meaningful, sustained trend lasting >3 candles.
 """
@@ -15,10 +15,10 @@ import logging
 import math
 import os
 import time
-import traceback
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from market_data import MarketDataStore, TradeStore, Signal, DEFAULT_SYMBOL_WHITELIST
@@ -162,10 +162,14 @@ async def download_trades(symbol, cfg):
     cursor = str(int(end * 1000))
     rows = []
     requests = 0
-    log.info("[historical] %s historical download STARTED, requested %.1f days", symbol, cfg.history_days)
+    log.info("[historical] %s DOWNLOAD STARTED", symbol)
+    log.info("[historical] %s   source = OKX historical trades", symbol)
+    log.info("[historical] %s   target_candle_timeframe = %ds", symbol, cfg.candle_interval_sec)
+    log.info("[historical] %s   requested_history_days = %.1f", symbol, cfg.history_days)
+
     while True:
         if cfg.max_history_requests_per_refresh and requests >= cfg.max_history_requests_per_refresh:
-            log.warning("[historical] %s download stopped: reached max requests (%d)", symbol, requests)
+            log.warning("[historical] %s DOWNLOAD STOPPED: reached max requests (%d)", symbol, requests)
             break
         try:
             batch = await asyncio.to_thread(
@@ -175,12 +179,12 @@ async def download_trades(symbol, cfg):
                 cfg.request_timeout_sec
             )
         except Exception as e:
-            log.error("[historical] %s download request #%d FAILED: %s", symbol, requests+1, e)
-            # Continue? The existing code breaks on exception, so we break as well.
+            log.error("[historical] %s DOWNLOAD ERROR: request #%d failed: %s", symbol, requests+1, e)
             break
         requests += 1
+
         if not batch:
-            log.debug("[historical] %s download request #%d returned empty batch", symbol, requests)
+            log.debug("[historical] %s DOWNLOAD: request #%d returned empty batch", symbol, requests)
             break
 
         parsed = []
@@ -201,12 +205,23 @@ async def download_trades(symbol, cfg):
             break
         rows.extend(t for t in parsed if start <= t["ts"] <= end)
         oldest = min(t["ts"] for t in parsed)
-        # Progress logging every 25 requests
-        if requests % 25 == 0:
-            coverage = (max(t["ts"] for t in rows) - min(t["ts"] for t in rows)) / 86400 if rows else 0.0
-            log.info("[historical] %s download progress: requests=%d trades=%d coverage=%.1f days",
-                     symbol, requests, len(rows), coverage)
 
+        # Progress every 10 requests
+        if requests % 10 == 0:
+            if rows:
+                oldest_ts = min(t["ts"] for t in rows)
+                newest_ts = max(t["ts"] for t in rows)
+                coverage = (newest_ts - oldest_ts) / 86400
+                log.info("[historical] %s DOWNLOAD PROGRESS", symbol)
+                log.info("[historical] %s   requests=%d trades=%d oldest=%s newest=%s coverage=%.1fd",
+                         symbol, requests, len(rows),
+                         datetime.fromtimestamp(oldest_ts).isoformat(),
+                         datetime.fromtimestamp(newest_ts).isoformat(),
+                         coverage)
+            else:
+                log.info("[historical] %s DOWNLOAD PROGRESS: requests=%d, trades so far=%d", symbol, requests, len(rows))
+
+        # Check if we have reached the start boundary
         if oldest <= start:
             break
         nxt = str(int(oldest * 1000) - 1)
@@ -215,7 +230,7 @@ async def download_trades(symbol, cfg):
         cursor = nxt
         await asyncio.sleep(max(0, cfg.request_delay_sec))
 
-    # deduplicate
+    # Deduplicate
     seen = set()
     out = []
     for t in sorted(rows, key=lambda x: (x["ts"], x["tradeId"])):
@@ -224,7 +239,15 @@ async def download_trades(symbol, cfg):
             seen.add(k)
             out.append(t)
 
-    log.info("[historical] %s historical download FINISHED: requests=%d trades=%d", symbol, requests, len(out))
+    if out:
+        oldest_ts = min(t["ts"] for t in out)
+        newest_ts = max(t["ts"] for t in out)
+        coverage = (newest_ts - oldest_ts) / 86400
+        log.info("[historical] %s DOWNLOAD FINISHED", symbol)
+        log.info("[historical] %s   requests=%d trades=%d coverage=%.1fd", symbol, requests, len(out), coverage)
+    else:
+        log.warning("[historical] %s DOWNLOAD FINISHED: zero trades returned", symbol)
+
     return out, requests
 
 
@@ -468,82 +491,88 @@ class HistoricalEngine(StrategyEngine):
     async def _prepare(self, symbol):
         """Download trades, build 5-minute candles, and create dataset."""
         cfg = self.config
-        log.info("[historical] %s preparation STARTED", symbol)
+        log.info("[historical] %s PREPARATION STARTED", symbol)
 
         os.makedirs(cfg.history_cache_dir, exist_ok=True)
         cache_path = self._cache_path(symbol)
 
-        # Try loading from cache
-        log.info("[historical] %s checking historical cache...", symbol)
-        if os.path.exists(cache_path):
-            try:
+        # --- Cache check ---
+        log.info("[historical] %s checking cache...", symbol)
+        cache_hit = False
+        try:
+            if os.path.exists(cache_path):
                 mtime = os.path.getmtime(cache_path)
                 age_hours = (time.time() - mtime) / 3600
                 if age_hours <= cfg.history_refresh_hours:
-                    log.info("[historical] %s valid cache found, loading...", symbol)
+                    # Try loading
                     candles = self._load_candles(cache_path)
                     if candles:
                         ds = Dataset(candles, cfg)
                         self._datasets[symbol] = ds
                         self._ready[symbol] = True
-                        log.info("[historical] %s loaded %d candles from cache", symbol, len(candles))
+                        log.info("[historical] %s cache VALID — loaded %d candles", symbol, len(candles))
+                        log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d",
+                                 symbol, cfg.candle_interval_sec, cfg.pattern_length, len(candles))
                         return
                     else:
-                        log.warning("[historical] %s cache file corrupted (empty); downloading fresh", symbol)
+                        log.warning("[historical] %s cache INVALID (corrupted/empty) — fresh download required", symbol)
                 else:
-                    log.info("[historical] %s historical cache is stale (age=%.1fh, refresh=%.1fh); downloading fresh",
+                    log.info("[historical] %s cache STALE (age=%.1fh > refresh=%.1fh) — fresh download required",
                              symbol, age_hours, cfg.history_refresh_hours)
-            except Exception as e:
-                log.warning("[historical] %s cache invalid: %s; downloading fresh", symbol, e)
-        else:
-            log.info("[historical] %s no historical cache found; downloading fresh history", symbol)
+            else:
+                log.info("[historical] %s cache MISS — fresh download required", symbol)
+        except Exception as e:
+            log.warning("[historical] %s cache INVALID (%s) — fresh download required", symbol, e)
 
-        # Download fresh
+        # --- Download fresh ---
         try:
             trades, requests = await download_trades(symbol, cfg)
         except Exception as e:
-            log.error("[historical] %s download_trades() raised exception: %s", symbol, e, exc_info=True)
+            log.error("[historical] %s PREPARATION FAILED: download_trades() raised exception", symbol, exc_info=True)
             self._ready[symbol] = False
             return
 
         if not trades:
-            log.error("[historical] %s historical download returned NO TRADES", symbol)
+            log.error("[historical] %s DOWNLOAD FAILED: no historical trades returned", symbol)
             self._ready[symbol] = False
             return
 
-        # Calculate coverage
+        # --- Validate coverage ---
         start_ts = min(t["ts"] for t in trades)
         end_ts = max(t["ts"] for t in trades)
         coverage_days = (end_ts - start_ts) / 86400
-        log.info("[historical] %s history coverage: %.1f days / requested %.1f days", symbol, coverage_days, cfg.history_days)
+        log.info("[historical] %s validating coverage: actual=%.1fd requested=%.1fd", symbol, coverage_days, cfg.history_days)
 
         if cfg.require_requested_history and coverage_days < cfg.history_days * 0.9:
-            log.error("[historical] %s preparation FAILED: insufficient history, coverage=%.1f days required>=%.1f days",
+            log.error("[historical] %s PREPARATION FAILED: insufficient coverage (%.1fd < %.1fd)",
                       symbol, coverage_days, cfg.history_days * 0.9)
             self._ready[symbol] = False
             return
 
-        # Build candles
-        log.info("[historical] %s building %ds candles STARTED", symbol, cfg.candle_interval_sec)
+        # --- Build candles ---
+        log.info("[historical] %s BUILDING %ds CANDLES STARTED", symbol, cfg.candle_interval_sec)
         candles = build_candles_from_trades(trades, interval_sec=cfg.candle_interval_sec)
-        log.info("[historical] %s building %ds candles FINISHED: candles=%d", symbol, cfg.candle_interval_sec, len(candles))
+        log.info("[historical] %s BUILDING %ds CANDLES FINISHED: %d candles", symbol, cfg.candle_interval_sec, len(candles))
 
         required_candles = cfg.pattern_length + cfg.min_forward_trend_candles
         if len(candles) < required_candles:
-            log.error("[historical] %s preparation FAILED: insufficient candles, available=%d required>=%d",
-                      symbol, len(candles), required_candles)
+            log.error("[historical] %s PREPARATION FAILED: insufficient candles (need %d, got %d)",
+                      symbol, required_candles, len(candles))
             self._ready[symbol] = False
             return
 
-        # Save cache
+        # --- Save cache ---
         self._save_candles(cache_path, candles)
 
-        # Create dataset
-        log.info("[historical] %s creating historical pattern dataset...", symbol)
+        # --- Build dataset ---
+        log.info("[historical] %s DATASET CREATION STARTED", symbol)
         ds = Dataset(candles, cfg)
         self._datasets[symbol] = ds
         self._ready[symbol] = True
-        log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d coverage=%.1f days",
+        log.info("[historical] %s DATASET READY: %d candles", symbol, len(candles))
+
+        # --- Final READY ---
+        log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d coverage=%.1fd",
                  symbol, cfg.candle_interval_sec, cfg.pattern_length, len(candles), coverage_days)
 
     def _save_candles(self, path, candles):
@@ -658,21 +687,28 @@ class HistoricalEngine(StrategyEngine):
             log.debug("[historical] %s cannot fetch current 3-candle pattern", symbol)
             return None
 
-        log.debug("[historical] %s evaluating current 3-candle %ds pattern", symbol, cfg.candle_interval_sec)
+        log.info("[historical] %s PATTERN ANALYSIS STARTED timeframe=%ds pattern_length=%d",
+                 symbol, cfg.candle_interval_sec, cfg.pattern_length)
 
         # Find historical matches
+        log.info("[historical] %s searching historical matches ...", symbol)
         matches = ds.find_matches(current_pattern)
-        if len(matches) < cfg.min_historical_matches:
-            log.info("[historical] %s only %d historical matches; need %d -> NO_SIGNAL",
-                     symbol, len(matches), cfg.min_historical_matches)
+        match_count = len(matches)
+        log.info("[historical] %s historical matches FOUND: %d", symbol, match_count)
+
+        if match_count < cfg.min_historical_matches:
+            log.info("[historical] %s NO_SIGNAL: insufficient matches (%d < %d)", symbol, match_count, cfg.min_historical_matches)
             return None
+
+        log.info("[historical] %s analyzing forward outcomes (min_forward=%d, dir_ratio=%.0f%%)",
+                 symbol, cfg.min_forward_trend_candles, cfg.min_forward_directional_ratio * 100)
 
         # Classify forward trends for each match
         bullish = 0
         bearish = 0
         neutral = 0
         details = []
-        top_n = min(cfg.log_top_matches, len(matches))
+        top_n = min(cfg.log_top_matches, match_count)
         for idx, (start_idx, sim) in enumerate(matches):
             outcome = ds.classify_forward(start_idx)
             if outcome == "bullish":
@@ -687,25 +723,22 @@ class HistoricalEngine(StrategyEngine):
         bullish_ratio = bullish / total if total else 0.0
         bearish_ratio = bearish / total if total else 0.0
 
-        log.info(
-            "[historical] %s pattern matches=%d (bullish=%d, bearish=%d, neutral=%d) "
-            "bull=%.1f%% bear=%.1f%%",
-            symbol, total, bullish, bearish, neutral,
-            bullish_ratio*100, bearish_ratio*100
-        )
+        log.info("[historical] %s HISTORICAL RESULT", symbol)
+        log.info("[historical] %s   matches=%d bullish=%d bearish=%d neutral=%d", symbol, total, bullish, bearish, neutral)
+        log.info("[historical] %s   bullish_agreement=%.1f%% bearish_agreement=%.1f%% required=%.0f%%",
+                 symbol, bullish_ratio * 100, bearish_ratio * 100, cfg.min_directional_agreement * 100)
         if details:
-            log.debug("[historical] Top matches: %s", details)
+            log.debug("[historical] %s   top matches: %s", symbol, details)
 
         direction = ""
         if bullish_ratio >= cfg.min_directional_agreement:
             direction = "long"
-            log.info("[historical] %s ACCEPTED LONG with %.1f%% bullish agreement", symbol, bullish_ratio*100)
+            log.info("[historical] %s SIGNAL = LONG (agreement=%.1f%%)", symbol, bullish_ratio * 100)
         elif bearish_ratio >= cfg.min_directional_agreement:
             direction = "short"
-            log.info("[historical] %s ACCEPTED SHORT with %.1f%% bearish agreement", symbol, bearish_ratio*100)
+            log.info("[historical] %s SIGNAL = SHORT (agreement=%.1f%%)", symbol, bearish_ratio * 100)
         else:
-            log.info("[historical] %s NO_SIGNAL: insufficient historical agreement, bullish=%.1f%% bearish=%.1f%% required=%.0f%%",
-                     symbol, bullish_ratio*100, bearish_ratio*100, cfg.min_directional_agreement*100)
+            log.info("[historical] %s SIGNAL = NO_SIGNAL (agreement below threshold)", symbol)
             return None
 
         c.direction = direction
