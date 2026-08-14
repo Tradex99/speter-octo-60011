@@ -498,6 +498,7 @@ class HistoricalEngine(StrategyEngine):
         self._candidates = {}
         self._datasets = {}
         self._ready = {}
+        self._ready_at = {}  # symbol -> time.time() when dataset became ready (data-readiness clock)
         self._tasks = {}
         self._last_attempt = {}
         self._last_failure = {}
@@ -563,6 +564,7 @@ class HistoricalEngine(StrategyEngine):
                         ds = Dataset(candles, cfg)
                         self._datasets[symbol] = ds
                         self._ready[symbol] = True
+                        self._ready_at[symbol] = time.time()
                         log.info("[historical] %s cache hit: %d candles ready (age=%.1fh)",
                                  symbol, len(candles), age_hours)
                         return
@@ -614,6 +616,7 @@ class HistoricalEngine(StrategyEngine):
         ds = Dataset(candles, cfg)
         self._datasets[symbol] = ds
         self._ready[symbol] = True
+        self._ready_at[symbol] = time.time()
         log.info("[historical] %s dataset ready: %d candles (timeframe=%ds pattern_length=%d coverage=%.1fd)",
                  symbol, len(candles), cfg.candle_interval_sec, cfg.pattern_length, coverage_days)
         self._last_failure.pop(symbol, None)
@@ -690,13 +693,19 @@ class HistoricalEngine(StrategyEngine):
             return None
         now = time.time()
         c.last_checked_at = now
-        if c.elapsed_sec >= cfg.max_observation_minutes * 60:
+
+        if not self._ready.get(symbol, False):
+            # Historical dataset is still downloading/preparing. A 365-day 5m
+            # download takes several minutes, so the observation window must
+            # not start ticking until data is actually ready — otherwise the
+            # candidate can expire before it ever gets a chance to evaluate.
+            return None
+
+        ready_at = self._ready_at.get(symbol, now)
+        if now - ready_at >= cfg.max_observation_minutes * 60:
             c.status = "EXPIRED"
             async with self._lock:
                 self._candidates.pop(symbol, None)
-            return None
-
-        if not self._ready.get(symbol, False):
             return None
 
         ds = self._datasets.get(symbol)
