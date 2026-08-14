@@ -294,14 +294,14 @@ async def download_candles(symbol, cfg):
         prev_oldest_ts = batch_oldest_ts
         after_cursor = next_cursor
 
-        # Periodic progress logging (not per-request) to avoid log spam.
+        # Periodic progress at DEBUG only — INFO stays limited to start/finish (see log design below).
         now_t = time.time()
         if candles_by_ts and (now_t - last_progress_log >= 5.0 or requests % 25 == 0):
             oldest_ts = min(candles_by_ts)
             newest_ts = max(candles_by_ts)
             coverage_days = (newest_ts - oldest_ts) / 86400
-            log.info("[historical] %s progress: %d candles, coverage=%.1f days",
-                     symbol, len(candles_by_ts), coverage_days)
+            log.debug("[historical] %s progress: %d candles, coverage=%.1f days",
+                      symbol, len(candles_by_ts), coverage_days)
             last_progress_log = now_t
 
         if batch_oldest_ts <= start:
@@ -313,9 +313,8 @@ async def download_candles(symbol, cfg):
 
     if candles_sorted:
         coverage_days = (candles_sorted[-1].ts - candles_sorted[0].ts) / 86400
-        log.info("[historical] %s download finished", symbol)
-        log.info("[historical] %s   requests=%d candles=%d coverage=%.1f days",
-                 symbol, requests, len(candles_sorted), coverage_days)
+        log.info("[historical] %s download finished: %d candles (%d requests, coverage=%.1f days)",
+                 symbol, len(candles_sorted), requests, coverage_days)
     else:
         log.warning("[historical] %s download finished: zero candles returned", symbol)
 
@@ -529,32 +528,31 @@ class HistoricalEngine(StrategyEngine):
                 last_fail = self._last_failure.get(s, 0)
                 if now - last_fail < self.config.retry_cooldown_sec:
                     if self._cooldown_announced.get(s) != last_fail:
-                        log.info("[historical] %s retry cooldown started", s)
-                        log.info("[historical] %s   duration=%.0fs", s, self.config.retry_cooldown_sec)
+                        log.debug("[historical] %s retry cooldown started (duration=%.0fs)",
+                                  s, self.config.retry_cooldown_sec)
                         self._cooldown_announced[s] = last_fail
                     continue
                 should_start = True
 
             if should_start:
                 if self._cooldown_announced.pop(s, None) is not None:
-                    log.info("[historical] %s retrying historical preparation", s)
+                    log.debug("[historical] %s retrying historical preparation", s)
                 self._last_attempt[s] = now
                 self._tasks[s] = asyncio.create_task(self._prepare(s))
-                log.info("[historical] %s preparation task CREATED", s)
+                log.debug("[historical] %s preparation task CREATED", s)
 
     async def snapshot(self):
         async with self._lock:
             return list(self._candidates.values())
 
     async def _prepare(self, symbol):
-        """Download trades, build 5-minute candles, and create dataset."""
+        """Download 5m candles from OKX (or reuse cache), build the dataset."""
         cfg = self.config
-        log.info("[historical] %s PREPARATION STARTED", symbol)
+        log.debug("[historical] %s preparation started", symbol)
 
         os.makedirs(cfg.history_cache_dir, exist_ok=True)
         cache_path = self._cache_path(symbol)
 
-        log.info("[historical] %s checking cache...", symbol)
         try:
             if os.path.exists(cache_path):
                 mtime = os.path.getmtime(cache_path)
@@ -565,17 +563,16 @@ class HistoricalEngine(StrategyEngine):
                         ds = Dataset(candles, cfg)
                         self._datasets[symbol] = ds
                         self._ready[symbol] = True
-                        log.info("[historical] %s cache VALID — loaded %d candles", symbol, len(candles))
-                        log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d",
-                                 symbol, cfg.candle_interval_sec, cfg.pattern_length, len(candles))
+                        log.info("[historical] %s cache hit: %d candles ready (age=%.1fh)",
+                                 symbol, len(candles), age_hours)
                         return
                     else:
                         log.warning("[historical] %s cache INVALID (corrupted/empty) — fresh download required", symbol)
                 else:
-                    log.info("[historical] %s cache STALE (age=%.1fh > refresh=%.1fh) — fresh download required",
-                             symbol, age_hours, cfg.history_refresh_hours)
+                    log.debug("[historical] %s cache STALE (age=%.1fh > refresh=%.1fh) — fresh download required",
+                              symbol, age_hours, cfg.history_refresh_hours)
             else:
-                log.info("[historical] %s cache MISS — fresh download required", symbol)
+                log.debug("[historical] %s cache MISS — fresh download required", symbol)
         except Exception as e:
             log.warning("[historical] %s cache INVALID (%s) — fresh download required", symbol, e)
 
@@ -594,9 +591,8 @@ class HistoricalEngine(StrategyEngine):
             return
 
         coverage_days = (candles[-1].ts - candles[0].ts) / 86400
-        log.info("[historical] %s HISTORICAL DATA SUMMARY", symbol)
-        log.info("[historical] %s   candles=%d newest=%.0f oldest=%.0f coverage_days=%.1f target_days=%.1f",
-                 symbol, len(candles), candles[-1].ts, candles[0].ts, coverage_days, cfg.history_days)
+        log.debug("[historical] %s   candles=%d newest=%.0f oldest=%.0f coverage_days=%.1f target_days=%.1f",
+                  symbol, len(candles), candles[-1].ts, candles[0].ts, coverage_days, cfg.history_days)
 
         if cfg.require_requested_history and coverage_days < cfg.history_days * 0.9:
             log.error("[historical] %s PREPARATION FAILED: insufficient coverage (%.1fd < %.1fd)",
@@ -618,10 +614,8 @@ class HistoricalEngine(StrategyEngine):
         ds = Dataset(candles, cfg)
         self._datasets[symbol] = ds
         self._ready[symbol] = True
-        log.info("[historical] %s dataset ready: %d candles", symbol, len(candles))
-
-        log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d coverage=%.1fd",
-                 symbol, cfg.candle_interval_sec, cfg.pattern_length, len(candles), coverage_days)
+        log.info("[historical] %s dataset ready: %d candles (timeframe=%ds pattern_length=%d coverage=%.1fd)",
+                 symbol, len(candles), cfg.candle_interval_sec, cfg.pattern_length, coverage_days)
         self._last_failure.pop(symbol, None)
 
     def _save_candles(self, path, candles):
