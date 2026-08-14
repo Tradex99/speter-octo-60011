@@ -161,7 +161,6 @@ async def download_trades(symbol, cfg):
     start = end - cfg.history_days * 86400
     rows = []
     requests = 0
-    # Start with no 'before' to get most recent trades
     before = None
     log.info("[historical] %s DOWNLOAD STARTED", symbol)
     log.info("[historical] %s   source = OKX historical trades", symbol)
@@ -177,13 +176,9 @@ async def download_trades(symbol, cfg):
         if before is not None:
             params["before"] = str(before)
 
-        # Log request details (without secrets)
-        log.info("[historical] %s API REQUEST", symbol)
-        log.info("[historical] %s   endpoint = %s", symbol, HISTORY_PATH)
-        log.info("[historical] %s   instId = %s", symbol, symbol)
-        log.info("[historical] %s   limit = 100", symbol)
-        if before is not None:
-            log.info("[historical] %s   before = %s", symbol, before)
+        # Log request details at DEBUG level only
+        log.debug("[historical] %s API REQUEST endpoint=%s instId=%s limit=100 before=%s",
+                  symbol, HISTORY_PATH, symbol, before if before else "<none>")
 
         try:
             response = await asyncio.to_thread(
@@ -197,16 +192,13 @@ async def download_trades(symbol, cfg):
             break
 
         requests += 1
-        http_status = 200  # urllib raises on non-200
         code = response.get("code")
         msg = response.get("msg")
         data = response.get("data", [])
 
-        log.info("[historical] %s API RESPONSE", symbol)
-        log.info("[historical] %s   http_status = %d", symbol, http_status)
-        log.info("[historical] %s   okx_code = %s", symbol, code)
-        log.info("[historical] %s   okx_msg = %s", symbol, msg)
-        log.info("[historical] %s   data_count = %d", symbol, len(data))
+        # Log response details at DEBUG level only
+        log.debug("[historical] %s API RESPONSE http_status=200 okx_code=%s okx_msg=%s data_count=%d",
+                  symbol, code, msg, len(data))
 
         if code != "0":
             log.error("[historical] %s API ERROR: code=%s msg=%s", symbol, code, msg)
@@ -216,7 +208,6 @@ async def download_trades(symbol, cfg):
             log.warning("[historical] %s DOWNLOAD EMPTY: OKX returned zero historical rows", symbol)
             break
 
-        # Parse trades
         parsed = []
         for z in data:
             ts = timestamp(z.get("ts"))
@@ -236,35 +227,28 @@ async def download_trades(symbol, cfg):
             log.warning("[historical] %s no parseable trades in batch", symbol)
             break
 
-        # Filter to the requested time range
+        # Filter to requested time range
         rows.extend(t for t in parsed if start <= t["ts"] <= end)
 
-        # Get the oldest trade in this batch to set 'before' for next request
-        # The API returns trades sorted by tradeId descending, so the last element is the oldest.
         oldest_trade = parsed[-1]
-        before = oldest_trade["tradeId"]   # use tradeId for pagination
+        before = oldest_trade["tradeId"]
 
-        # Progress every 10 requests
-        if requests % 10 == 0:
-            if rows:
-                oldest_ts = min(t["ts"] for t in rows)
-                newest_ts = max(t["ts"] for t in rows)
-                coverage = (newest_ts - oldest_ts) / 86400
-                log.info("[historical] %s DOWNLOAD PROGRESS", symbol)
-                log.info("[historical] %s   requests=%d trades=%d oldest=%s newest=%s coverage=%.1fd",
-                         symbol, requests, len(rows),
-                         datetime.fromtimestamp(oldest_ts).isoformat(),
-                         datetime.fromtimestamp(newest_ts).isoformat(),
-                         coverage)
+        # Progress every 50 requests
+        if requests % 50 == 0 and rows:
+            oldest_ts = min(t["ts"] for t in rows)
+            newest_ts = max(t["ts"] for t in rows)
+            coverage_days = (newest_ts - oldest_ts) / 86400
+            progress_pct = min(100.0, (coverage_days / cfg.history_days) * 100)
+            log.info("[historical] %s DOWNLOAD PROGRESS", symbol)
+            log.info("[historical] %s   requests=%d trades=%d coverage=%.1f days (%.1f%%)",
+                     symbol, requests, len(rows), coverage_days, progress_pct)
 
-        # Check if we have reached the start boundary
         if oldest_trade["ts"] <= start:
             break
 
-        # Small delay between requests
         await asyncio.sleep(max(0, cfg.request_delay_sec))
 
-    # Deduplicate (just in case)
+    # Deduplicate
     seen = set()
     out = []
     for t in sorted(rows, key=lambda x: (x["ts"], x["tradeId"])):
@@ -276,9 +260,9 @@ async def download_trades(symbol, cfg):
     if out:
         oldest_ts = min(t["ts"] for t in out)
         newest_ts = max(t["ts"] for t in out)
-        coverage = (newest_ts - oldest_ts) / 86400
+        coverage_days = (newest_ts - oldest_ts) / 86400
         log.info("[historical] %s DOWNLOAD FINISHED", symbol)
-        log.info("[historical] %s   requests=%d trades=%d coverage=%.1fd", symbol, requests, len(out), coverage)
+        log.info("[historical] %s   requests=%d trades=%d coverage=%.1f days", symbol, requests, len(out), coverage_days)
     else:
         log.warning("[historical] %s DOWNLOAD FINISHED: zero trades returned", symbol)
 
@@ -463,9 +447,10 @@ class HistoricalEngine(StrategyEngine):
         self._datasets = {}
         self._ready = {}
         self._tasks = {}
-        self._last_attempt = {}   # symbol -> last preparation start time
-        self._last_failure = {}   # symbol -> last failure timestamp
+        self._last_attempt = {}
+        self._last_failure = {}
         self._last_signal = {}
+        self._last_evaluated_ts = {}  # symbol -> last pattern candle timestamp (for avoiding repeated logs)
         self._lock = asyncio.Lock()
 
     def _cache_path(self, symbol):
@@ -485,10 +470,8 @@ class HistoricalEngine(StrategyEngine):
 
         now = time.time()
         for s in symbols:
-            # Check if we should start a preparation task
             should_start = False
             if s not in self._tasks or self._tasks[s].done():
-                # Check if we have a recent failure cooldown
                 last_fail = self._last_failure.get(s, 0)
                 if now - last_fail < self.config.retry_cooldown_sec:
                     log.info("[historical] %s preparation skipped (cooldown, %.1fs remaining)", s,
@@ -513,7 +496,6 @@ class HistoricalEngine(StrategyEngine):
         os.makedirs(cfg.history_cache_dir, exist_ok=True)
         cache_path = self._cache_path(symbol)
 
-        # --- Cache check ---
         log.info("[historical] %s checking cache...", symbol)
         try:
             if os.path.exists(cache_path):
@@ -539,7 +521,6 @@ class HistoricalEngine(StrategyEngine):
         except Exception as e:
             log.warning("[historical] %s cache INVALID (%s) — fresh download required", symbol, e)
 
-        # --- Download fresh ---
         try:
             trades, requests = await download_trades(symbol, cfg)
         except Exception as e:
@@ -554,7 +535,6 @@ class HistoricalEngine(StrategyEngine):
             self._last_failure[symbol] = time.time()
             return
 
-        # --- Validate coverage ---
         start_ts = min(t["ts"] for t in trades)
         end_ts = max(t["ts"] for t in trades)
         coverage_days = (end_ts - start_ts) / 86400
@@ -567,7 +547,6 @@ class HistoricalEngine(StrategyEngine):
             self._last_failure[symbol] = time.time()
             return
 
-        # --- Build candles ---
         log.info("[historical] %s BUILDING %ds CANDLES STARTED", symbol, cfg.candle_interval_sec)
         candles = build_candles_from_trades(trades, interval_sec=cfg.candle_interval_sec)
         log.info("[historical] %s BUILDING %ds CANDLES FINISHED: %d candles", symbol, cfg.candle_interval_sec, len(candles))
@@ -580,20 +559,17 @@ class HistoricalEngine(StrategyEngine):
             self._last_failure[symbol] = time.time()
             return
 
-        # --- Save cache ---
         self._save_candles(cache_path, candles)
 
-        # --- Build dataset ---
         log.info("[historical] %s DATASET CREATION STARTED", symbol)
         ds = Dataset(candles, cfg)
         self._datasets[symbol] = ds
         self._ready[symbol] = True
         log.info("[historical] %s DATASET READY: %d candles", symbol, len(candles))
 
-        # --- Final READY ---
         log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d coverage=%.1fd",
                  symbol, cfg.candle_interval_sec, cfg.pattern_length, len(candles), coverage_days)
-        self._last_failure.pop(symbol, None)  # clear failure flag
+        self._last_failure.pop(symbol, None)
 
     def _save_candles(self, path, candles):
         tmp = path + ".tmp"
@@ -697,16 +673,19 @@ class HistoricalEngine(StrategyEngine):
         if not c.data_ready:
             return None
 
-        # Get current 3 completed 5-minute candles
         current_pattern = await self._get_current_pattern(symbol)
         if current_pattern is None or len(current_pattern) != cfg.pattern_length:
-            log.debug("[historical] %s cannot fetch current 3-candle pattern", symbol)
             return None
+
+        # Check if we already evaluated this exact pattern (by timestamp of the oldest candle)
+        pattern_ts = current_pattern[0].ts
+        if self._last_evaluated_ts.get(symbol) == pattern_ts:
+            return None  # already evaluated this candle
+        self._last_evaluated_ts[symbol] = pattern_ts
 
         log.info("[historical] %s PATTERN ANALYSIS STARTED timeframe=%ds pattern_length=%d",
                  symbol, cfg.candle_interval_sec, cfg.pattern_length)
 
-        # Find historical matches
         log.info("[historical] %s searching historical matches ...", symbol)
         matches = ds.find_matches(current_pattern)
         match_count = len(matches)
