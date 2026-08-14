@@ -26,7 +26,17 @@ from .base import StrategyContext, StrategyEngine
 
 log = logging.getLogger("okx_futures.historical")
 BASE = "https://www.okx.com"
-HISTORY_PATH = "/api/v5/market/history-trades"
+HISTORY_CANDLES_PATH = "/api/v5/market/history-candles"
+
+# Maps candle_interval_sec -> OKX 'bar' query param value.
+_BAR_BY_INTERVAL_SEC = {
+    60: "1m", 180: "3m", 300: "5m", 900: "15m", 1800: "30m",
+    3600: "1H", 7200: "2H", 14400: "4H", 21600: "6H", 43200: "12H", 86400: "1D",
+}
+
+
+def bar_from_interval(interval_sec: int) -> str:
+    return _BAR_BY_INTERVAL_SEC.get(interval_sec, "5m")
 
 
 # ---------------------------------------------------------------------
@@ -151,177 +161,165 @@ def okx_get(path, params, timeout):
     return data
 
 
-async def download_trades(symbol, cfg):
+async def download_candles(symbol, cfg):
     """
-    Download trades for the symbol for the last cfg.history_days days.
-    Returns list of trade dicts and request count.
+    Download completed OHLCV candles directly from OKX's historical
+    candlestick endpoint (/api/v5/market/history-candles), paginating
+    backward in time until cfg.history_days of coverage is collected or
+    OKX has no older data left.
 
-    PAGINATION (root-cause fix):
-    Per OKX's documented v5 REST pagination convention (the same rule used by
-    /api/v5/market/history-trades and every other paginated v5 endpoint):
-        after=<id>   -> "return records EARLIER than <id>"  (moves backward in time)
-        before=<id>  -> "return records NEWER than <id>"    (moves forward in time)
-    See: https://www.okx.com/docs-v5/trick_en/#order-management-pagination
-    ccxt's OKX connector pages fetchTrades the same way (cursor field 'tradeId',
-    cursor param 'after').
+    Returns (list[Candle] sorted oldest->newest, request_count).
 
-    The previous implementation sent `before=<oldest tradeId in batch>`, which
-    OKX interprets as "give me trades newer than that ID" — i.e. it walked
-    FORWARD toward the present instead of backward into history. That is why
-    trade counts plateaued and coverage stayed at 0.0 days after hundreds of
-    requests: each request kept re-fetching the same recent window.
-
-    To walk backward we seed `after` with the oldest tradeId seen so far.
+    PAGINATION:
+    OKX returns history-candles newest-first within each batch. Per the
+    documented v5 semantics for this endpoint, `after=<ts_ms>` means
+    "return records EARLIER than <ts_ms>" (moves backward in time), while
+    `before=<ts_ms>` means "return records NEWER than <ts_ms>" (moves
+    forward, and is not usable to reach older data). To walk backward
+    through history we repeatedly set `after` to the timestamp of the
+    OLDEST candle in the previous batch.
+    See: https://www.okx.com/docs-v5/en/#order-book-trading-market-data-get-candlesticks-history
     """
+    bar = bar_from_interval(cfg.candle_interval_sec)
     end = time.time()
     start = end - cfg.history_days * 86400
-    rows = []
+
+    candles_by_ts: Dict[float, Candle] = {}
     requests = 0
-    after_cursor = None   # tradeId cursor: next batch must be OLDER than this
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    after_cursor = None      # ts (seconds) cursor: next batch must be OLDER than this
     prev_cursor = None
     prev_oldest_ts = None
-    prev_batch_ids = None
-    log.info("[historical] %s DOWNLOAD STARTED", symbol)
-    log.info("[historical] %s   source = OKX historical trades", symbol)
-    log.info("[historical] %s   target_candle_timeframe = %ds", symbol, cfg.candle_interval_sec)
-    log.info("[historical] %s   requested_history_days = %.1f", symbol, cfg.history_days)
+    last_progress_log = 0.0
+
+    log.info("[historical] %s downloading 5m candles...", symbol)
+    log.debug("[historical] %s   source = OKX history-candles bar=%s", symbol, bar)
+    log.debug("[historical] %s   requested_history_days = %.1f", symbol, cfg.history_days)
 
     while True:
         if cfg.max_history_requests_per_refresh and requests >= cfg.max_history_requests_per_refresh:
-            log.warning("[historical] %s DOWNLOAD STOPPED: reached max requests (%d)", symbol, requests)
+            log.warning("[historical] %s download stopped: reached max requests (%d)", symbol, requests)
             break
 
-        params = {"instId": symbol, "limit": "100"}
+        params = {"instId": symbol, "bar": bar, "limit": "100"}
         if after_cursor is not None:
-            params["after"] = str(after_cursor)
+            params["after"] = str(int(after_cursor * 1000))
 
-        # Log request details at DEBUG level only
-        log.debug("[historical] %s API REQUEST endpoint=%s instId=%s limit=100 after=%s",
-                  symbol, HISTORY_PATH, symbol, after_cursor if after_cursor else "<none>")
+        log.debug("[historical] %s API REQUEST endpoint=%s instId=%s bar=%s after=%s",
+                  symbol, HISTORY_CANDLES_PATH, symbol, bar, after_cursor if after_cursor else "<none>")
 
         try:
             response = await asyncio.to_thread(
                 okx_get,
-                HISTORY_PATH,
+                HISTORY_CANDLES_PATH,
                 params,
                 cfg.request_timeout_sec
             )
         except Exception as e:
-            log.error("[historical] %s API REQUEST FAILED: %s", symbol, e)
-            break
+            consecutive_errors += 1
+            log.error("[historical] %s API request failed (%d/%d): %s",
+                      symbol, consecutive_errors, max_consecutive_errors, e)
+            if consecutive_errors >= max_consecutive_errors:
+                log.error("[historical] %s too many consecutive errors, aborting download", symbol)
+                break
+            await asyncio.sleep(max(1.0, cfg.request_delay_sec * 10))
+            continue
 
         requests += 1
         code = response.get("code")
         msg = response.get("msg")
         data = response.get("data", [])
 
-        # Log response details at DEBUG level only
-        log.debug("[historical] %s API RESPONSE http_status=200 okx_code=%s okx_msg=%s data_count=%d",
+        log.debug("[historical] %s API RESPONSE okx_code=%s okx_msg=%s data_count=%d",
                   symbol, code, msg, len(data))
 
         if code != "0":
-            log.error("[historical] %s API ERROR: code=%s msg=%s", symbol, code, msg)
-            break
+            consecutive_errors += 1
+            log.error("[historical] %s API error (%d/%d): code=%s msg=%s",
+                      symbol, consecutive_errors, max_consecutive_errors, code, msg)
+            if consecutive_errors >= max_consecutive_errors:
+                log.error("[historical] %s too many consecutive API errors, aborting download", symbol)
+                break
+            await asyncio.sleep(max(1.0, cfg.request_delay_sec * 10))
+            continue
+
+        consecutive_errors = 0
 
         if not data:
-            log.warning("[historical] %s DOWNLOAD EMPTY: OKX returned zero historical rows", symbol)
+            log.info("[historical] %s no older data available from OKX — download complete", symbol)
             break
 
-        parsed = []
-        for z in data:
-            ts = timestamp(z.get("ts"))
-            px = f(z.get("px"))
-            qty = f(z.get("sz"))
-            side = side_of(z)
-            trade_id = str(z.get("tradeId") or "")
-            if ts is not None and px > 0 and qty > 0 and side:
-                parsed.append({
-                    "ts": ts,
-                    "price": px,
-                    "qty": qty,
-                    "side": side,
-                    "tradeId": trade_id
-                })
-        if not parsed:
-            log.warning("[historical] %s no parseable trades in batch", symbol)
+        # Parse this batch: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+        batch = []
+        for row in data:
+            try:
+                ts = f(row[0]) / 1000.0
+                o = f(row[1])
+                h = f(row[2])
+                l = f(row[3])
+                c = f(row[4])
+                vol = f(row[5])
+                confirm = str(row[8]) if len(row) > 8 else "1"
+            except (IndexError, TypeError, ValueError):
+                continue
+            if confirm != "1":
+                continue  # skip the still-forming candle
+            if ts <= 0 or o <= 0 or h <= 0 or l <= 0 or c <= 0:
+                continue
+            batch.append((ts, Candle(ts=ts, open=o, high=h, low=l, close=c, volume=vol)))
+
+        if not batch:
+            log.warning("[historical] %s batch had no valid candles, stopping", symbol)
             break
 
-        # OKX returns trades newest-first within a batch, so the last parsed
-        # element is the oldest trade in this batch.
-        batch_newest = parsed[0]
-        batch_oldest = parsed[-1]
-        batch_ids = {t["tradeId"] for t in parsed}
-        next_cursor = batch_oldest["tradeId"]
+        # OKX returns candles newest-first within a batch.
+        batch_newest_ts = batch[0][0]
+        batch_oldest_ts = batch[-1][0]
+        next_cursor = batch_oldest_ts
 
-        log.debug("[historical] %s DEBUG request=%d", symbol, requests)
-        log.debug("[historical] %s   batch_newest=%.0f batch_oldest=%.0f", symbol, batch_newest["ts"], batch_oldest["ts"])
-        log.debug("[historical] %s   prev_cursor=%s next_cursor=%s", symbol,
-                  prev_cursor if prev_cursor is not None else "<none>", next_cursor)
-
-        # --- Duplicate-batch detection -------------------------------------
-        if prev_batch_ids is not None and batch_ids == prev_batch_ids:
-            log.error("[historical] %s DUPLICATE HISTORICAL BATCH DETECTED", symbol)
-            break
-
-        # --- Pagination safety check: cursor and timestamps must move backward
-        stalled = False
-        try:
-            if prev_cursor is not None and int(next_cursor) >= int(prev_cursor):
-                stalled = True
-        except (TypeError, ValueError):
-            pass
-        if prev_oldest_ts is not None and batch_oldest["ts"] >= prev_oldest_ts:
-            stalled = True
-
+        # --- Pagination safety check: cursor must move strictly backward ---
+        stalled = (prev_cursor is not None and next_cursor >= prev_cursor) or \
+                  (prev_oldest_ts is not None and batch_oldest_ts >= prev_oldest_ts)
         if stalled:
-            log.error("[historical] %s PAGINATION STALLED", symbol)
-            log.error("[historical] %s   previous_cursor=%s next_cursor=%s", symbol, prev_cursor, next_cursor)
-            log.error("[historical] %s   oldest_batch_timestamp=%.0f newest_batch_timestamp=%.0f",
-                      symbol, batch_oldest["ts"], batch_newest["ts"])
+            log.error("[historical] %s pagination stalled (prev_cursor=%s next_cursor=%s), stopping",
+                      symbol, prev_cursor, next_cursor)
             break
 
-        # Filter to requested time range
-        rows.extend(t for t in parsed if start <= t["ts"] <= end)
+        for ts, candle in batch:
+            if start <= ts <= end:
+                candles_by_ts[ts] = candle
 
         prev_cursor = next_cursor
-        prev_oldest_ts = batch_oldest["ts"]
-        prev_batch_ids = batch_ids
+        prev_oldest_ts = batch_oldest_ts
         after_cursor = next_cursor
 
-        # Progress every 50 requests
-        if requests % 50 == 0 and rows:
-            oldest_ts = min(t["ts"] for t in rows)
-            newest_ts = max(t["ts"] for t in rows)
+        # Periodic progress logging (not per-request) to avoid log spam.
+        now_t = time.time()
+        if candles_by_ts and (now_t - last_progress_log >= 5.0 or requests % 25 == 0):
+            oldest_ts = min(candles_by_ts)
+            newest_ts = max(candles_by_ts)
             coverage_days = (newest_ts - oldest_ts) / 86400
-            progress_pct = min(100.0, (coverage_days / cfg.history_days) * 100)
-            log.info("[historical] %s DOWNLOAD PROGRESS", symbol)
-            log.info("[historical] %s   requests=%d trades=%d coverage=%.1f days (%.1f%%)",
-                     symbol, requests, len(rows), coverage_days, progress_pct)
+            log.info("[historical] %s progress: %d candles, coverage=%.1f days",
+                     symbol, len(candles_by_ts), coverage_days)
+            last_progress_log = now_t
 
-        if batch_oldest["ts"] <= start:
+        if batch_oldest_ts <= start:
             break
 
         await asyncio.sleep(max(0, cfg.request_delay_sec))
 
-    # Deduplicate
-    seen = set()
-    out = []
-    for t in sorted(rows, key=lambda x: (x["ts"], x["tradeId"])):
-        k = (t["ts"], t["price"], t["qty"], t["side"], t["tradeId"])
-        if k not in seen:
-            seen.add(k)
-            out.append(t)
+    candles_sorted = [candles_by_ts[ts] for ts in sorted(candles_by_ts)]
 
-    if out:
-        oldest_ts = min(t["ts"] for t in out)
-        newest_ts = max(t["ts"] for t in out)
-        coverage_days = (newest_ts - oldest_ts) / 86400
-        log.info("[historical] %s DOWNLOAD FINISHED", symbol)
-        log.info("[historical] %s   requests=%d trades=%d coverage=%.1f days", symbol, requests, len(out), coverage_days)
+    if candles_sorted:
+        coverage_days = (candles_sorted[-1].ts - candles_sorted[0].ts) / 86400
+        log.info("[historical] %s download finished", symbol)
+        log.info("[historical] %s   requests=%d candles=%d coverage=%.1f days",
+                 symbol, requests, len(candles_sorted), coverage_days)
     else:
-        log.warning("[historical] %s DOWNLOAD FINISHED: zero trades returned", symbol)
+        log.warning("[historical] %s download finished: zero candles returned", symbol)
 
-    return out, requests
+    return candles_sorted, requests
 
 
 def build_candles_from_trades(trades, interval_sec=300):
@@ -582,25 +580,23 @@ class HistoricalEngine(StrategyEngine):
             log.warning("[historical] %s cache INVALID (%s) — fresh download required", symbol, e)
 
         try:
-            trades, requests = await download_trades(symbol, cfg)
+            candles, requests = await download_candles(symbol, cfg)
         except Exception as e:
-            log.error("[historical] %s PREPARATION FAILED: download_trades() raised exception", symbol, exc_info=True)
+            log.error("[historical] %s PREPARATION FAILED: download_candles() raised exception", symbol, exc_info=True)
             self._ready[symbol] = False
             self._last_failure[symbol] = time.time()
             return
 
-        if not trades:
-            log.error("[historical] %s DOWNLOAD FAILED: no historical trades returned", symbol)
+        if not candles:
+            log.error("[historical] %s DOWNLOAD FAILED: no historical candles returned", symbol)
             self._ready[symbol] = False
             self._last_failure[symbol] = time.time()
             return
 
-        start_ts = min(t["ts"] for t in trades)
-        end_ts = max(t["ts"] for t in trades)
-        coverage_days = (end_ts - start_ts) / 86400
+        coverage_days = (candles[-1].ts - candles[0].ts) / 86400
         log.info("[historical] %s HISTORICAL DATA SUMMARY", symbol)
-        log.info("[historical] %s   trades=%d newest=%.0f oldest=%.0f coverage_days=%.1f target_days=%.1f",
-                 symbol, len(trades), end_ts, start_ts, coverage_days, cfg.history_days)
+        log.info("[historical] %s   candles=%d newest=%.0f oldest=%.0f coverage_days=%.1f target_days=%.1f",
+                 symbol, len(candles), candles[-1].ts, candles[0].ts, coverage_days, cfg.history_days)
 
         if cfg.require_requested_history and coverage_days < cfg.history_days * 0.9:
             log.error("[historical] %s PREPARATION FAILED: insufficient coverage (%.1fd < %.1fd)",
@@ -608,14 +604,6 @@ class HistoricalEngine(StrategyEngine):
             self._ready[symbol] = False
             self._last_failure[symbol] = time.time()
             return
-
-        log.info("[historical] %s BUILDING %ds CANDLES STARTED", symbol, cfg.candle_interval_sec)
-        candles = build_candles_from_trades(trades, interval_sec=cfg.candle_interval_sec)
-        log.info("[historical] %s BUILDING %ds CANDLES FINISHED: %d candles", symbol, cfg.candle_interval_sec, len(candles))
-        if candles:
-            candle_coverage_days = (candles[-1].ts - candles[0].ts) / 86400
-            log.info("[historical] %s   oldest_candle=%.0f newest_candle=%.0f coverage_days=%.1f",
-                     symbol, candles[0].ts, candles[-1].ts, candle_coverage_days)
 
         required_candles = cfg.pattern_length + cfg.min_forward_trend_candles
         if len(candles) < required_candles:
@@ -627,11 +615,10 @@ class HistoricalEngine(StrategyEngine):
 
         self._save_candles(cache_path, candles)
 
-        log.info("[historical] %s DATASET CREATION STARTED", symbol)
         ds = Dataset(candles, cfg)
         self._datasets[symbol] = ds
         self._ready[symbol] = True
-        log.info("[historical] %s DATASET READY: %d candles", symbol, len(candles))
+        log.info("[historical] %s dataset ready: %d candles", symbol, len(candles))
 
         log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d coverage=%.1fd",
                  symbol, cfg.candle_interval_sec, cfg.pattern_length, len(candles), coverage_days)
