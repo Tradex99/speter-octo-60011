@@ -155,13 +155,32 @@ async def download_trades(symbol, cfg):
     """
     Download trades for the symbol for the last cfg.history_days days.
     Returns list of trade dicts and request count.
-    Uses correct pagination with tradeId.
+
+    PAGINATION (root-cause fix):
+    Per OKX's documented v5 REST pagination convention (the same rule used by
+    /api/v5/market/history-trades and every other paginated v5 endpoint):
+        after=<id>   -> "return records EARLIER than <id>"  (moves backward in time)
+        before=<id>  -> "return records NEWER than <id>"    (moves forward in time)
+    See: https://www.okx.com/docs-v5/trick_en/#order-management-pagination
+    ccxt's OKX connector pages fetchTrades the same way (cursor field 'tradeId',
+    cursor param 'after').
+
+    The previous implementation sent `before=<oldest tradeId in batch>`, which
+    OKX interprets as "give me trades newer than that ID" — i.e. it walked
+    FORWARD toward the present instead of backward into history. That is why
+    trade counts plateaued and coverage stayed at 0.0 days after hundreds of
+    requests: each request kept re-fetching the same recent window.
+
+    To walk backward we seed `after` with the oldest tradeId seen so far.
     """
     end = time.time()
     start = end - cfg.history_days * 86400
     rows = []
     requests = 0
-    before = None
+    after_cursor = None   # tradeId cursor: next batch must be OLDER than this
+    prev_cursor = None
+    prev_oldest_ts = None
+    prev_batch_ids = None
     log.info("[historical] %s DOWNLOAD STARTED", symbol)
     log.info("[historical] %s   source = OKX historical trades", symbol)
     log.info("[historical] %s   target_candle_timeframe = %ds", symbol, cfg.candle_interval_sec)
@@ -173,12 +192,12 @@ async def download_trades(symbol, cfg):
             break
 
         params = {"instId": symbol, "limit": "100"}
-        if before is not None:
-            params["before"] = str(before)
+        if after_cursor is not None:
+            params["after"] = str(after_cursor)
 
         # Log request details at DEBUG level only
-        log.debug("[historical] %s API REQUEST endpoint=%s instId=%s limit=100 before=%s",
-                  symbol, HISTORY_PATH, symbol, before if before else "<none>")
+        log.debug("[historical] %s API REQUEST endpoint=%s instId=%s limit=100 after=%s",
+                  symbol, HISTORY_PATH, symbol, after_cursor if after_cursor else "<none>")
 
         try:
             response = await asyncio.to_thread(
@@ -227,11 +246,47 @@ async def download_trades(symbol, cfg):
             log.warning("[historical] %s no parseable trades in batch", symbol)
             break
 
+        # OKX returns trades newest-first within a batch, so the last parsed
+        # element is the oldest trade in this batch.
+        batch_newest = parsed[0]
+        batch_oldest = parsed[-1]
+        batch_ids = {t["tradeId"] for t in parsed}
+        next_cursor = batch_oldest["tradeId"]
+
+        log.debug("[historical] %s DEBUG request=%d", symbol, requests)
+        log.debug("[historical] %s   batch_newest=%.0f batch_oldest=%.0f", symbol, batch_newest["ts"], batch_oldest["ts"])
+        log.debug("[historical] %s   prev_cursor=%s next_cursor=%s", symbol,
+                  prev_cursor if prev_cursor is not None else "<none>", next_cursor)
+
+        # --- Duplicate-batch detection -------------------------------------
+        if prev_batch_ids is not None and batch_ids == prev_batch_ids:
+            log.error("[historical] %s DUPLICATE HISTORICAL BATCH DETECTED", symbol)
+            break
+
+        # --- Pagination safety check: cursor and timestamps must move backward
+        stalled = False
+        try:
+            if prev_cursor is not None and int(next_cursor) >= int(prev_cursor):
+                stalled = True
+        except (TypeError, ValueError):
+            pass
+        if prev_oldest_ts is not None and batch_oldest["ts"] >= prev_oldest_ts:
+            stalled = True
+
+        if stalled:
+            log.error("[historical] %s PAGINATION STALLED", symbol)
+            log.error("[historical] %s   previous_cursor=%s next_cursor=%s", symbol, prev_cursor, next_cursor)
+            log.error("[historical] %s   oldest_batch_timestamp=%.0f newest_batch_timestamp=%.0f",
+                      symbol, batch_oldest["ts"], batch_newest["ts"])
+            break
+
         # Filter to requested time range
         rows.extend(t for t in parsed if start <= t["ts"] <= end)
 
-        oldest_trade = parsed[-1]
-        before = oldest_trade["tradeId"]
+        prev_cursor = next_cursor
+        prev_oldest_ts = batch_oldest["ts"]
+        prev_batch_ids = batch_ids
+        after_cursor = next_cursor
 
         # Progress every 50 requests
         if requests % 50 == 0 and rows:
@@ -243,7 +298,7 @@ async def download_trades(symbol, cfg):
             log.info("[historical] %s   requests=%d trades=%d coverage=%.1f days (%.1f%%)",
                      symbol, requests, len(rows), coverage_days, progress_pct)
 
-        if oldest_trade["ts"] <= start:
+        if batch_oldest["ts"] <= start:
             break
 
         await asyncio.sleep(max(0, cfg.request_delay_sec))
@@ -451,6 +506,7 @@ class HistoricalEngine(StrategyEngine):
         self._last_failure = {}
         self._last_signal = {}
         self._last_evaluated_ts = {}  # symbol -> last pattern candle timestamp (for avoiding repeated logs)
+        self._cooldown_announced = {}  # symbol -> failure timestamp already logged as "cooldown started"
         self._lock = asyncio.Lock()
 
     def _cache_path(self, symbol):
@@ -474,12 +530,16 @@ class HistoricalEngine(StrategyEngine):
             if s not in self._tasks or self._tasks[s].done():
                 last_fail = self._last_failure.get(s, 0)
                 if now - last_fail < self.config.retry_cooldown_sec:
-                    log.info("[historical] %s preparation skipped (cooldown, %.1fs remaining)", s,
-                             self.config.retry_cooldown_sec - (now - last_fail))
+                    if self._cooldown_announced.get(s) != last_fail:
+                        log.info("[historical] %s retry cooldown started", s)
+                        log.info("[historical] %s   duration=%.0fs", s, self.config.retry_cooldown_sec)
+                        self._cooldown_announced[s] = last_fail
                     continue
                 should_start = True
 
             if should_start:
+                if self._cooldown_announced.pop(s, None) is not None:
+                    log.info("[historical] %s retrying historical preparation", s)
                 self._last_attempt[s] = now
                 self._tasks[s] = asyncio.create_task(self._prepare(s))
                 log.info("[historical] %s preparation task CREATED", s)
@@ -538,7 +598,9 @@ class HistoricalEngine(StrategyEngine):
         start_ts = min(t["ts"] for t in trades)
         end_ts = max(t["ts"] for t in trades)
         coverage_days = (end_ts - start_ts) / 86400
-        log.info("[historical] %s validating coverage: actual=%.1fd requested=%.1fd", symbol, coverage_days, cfg.history_days)
+        log.info("[historical] %s HISTORICAL DATA SUMMARY", symbol)
+        log.info("[historical] %s   trades=%d newest=%.0f oldest=%.0f coverage_days=%.1f target_days=%.1f",
+                 symbol, len(trades), end_ts, start_ts, coverage_days, cfg.history_days)
 
         if cfg.require_requested_history and coverage_days < cfg.history_days * 0.9:
             log.error("[historical] %s PREPARATION FAILED: insufficient coverage (%.1fd < %.1fd)",
@@ -550,6 +612,10 @@ class HistoricalEngine(StrategyEngine):
         log.info("[historical] %s BUILDING %ds CANDLES STARTED", symbol, cfg.candle_interval_sec)
         candles = build_candles_from_trades(trades, interval_sec=cfg.candle_interval_sec)
         log.info("[historical] %s BUILDING %ds CANDLES FINISHED: %d candles", symbol, cfg.candle_interval_sec, len(candles))
+        if candles:
+            candle_coverage_days = (candles[-1].ts - candles[0].ts) / 86400
+            log.info("[historical] %s   oldest_candle=%.0f newest_candle=%.0f coverage_days=%.1f",
+                     symbol, candles[0].ts, candles[-1].ts, candle_coverage_days)
 
         required_candles = cfg.pattern_length + cfg.min_forward_trend_candles
         if len(candles) < required_candles:
