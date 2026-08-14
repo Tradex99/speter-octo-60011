@@ -53,6 +53,7 @@ class HistoricalEngineConfig:
     request_delay_sec: float = 0.12
     max_history_requests_per_refresh: int = 0
     require_requested_history: bool = False
+    retry_cooldown_sec: float = 300.0   # 5 minutes after failure
 
     # Candles
     candle_interval_sec: int = 300           # 5 minutes
@@ -147,21 +148,21 @@ def okx_get(path, params, timeout):
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read().decode())
-    if data.get("code") != "0":
-        raise RuntimeError(f"OKX error {data.get('code')}: {data.get('msg')}")
-    return data.get("data") or []
+    return data
 
 
 async def download_trades(symbol, cfg):
     """
     Download trades for the symbol for the last cfg.history_days days.
     Returns list of trade dicts and request count.
+    Uses correct pagination with tradeId.
     """
     end = time.time()
     start = end - cfg.history_days * 86400
-    cursor = str(int(end * 1000))
     rows = []
     requests = 0
+    # Start with no 'before' to get most recent trades
+    before = None
     log.info("[historical] %s DOWNLOAD STARTED", symbol)
     log.info("[historical] %s   source = OKX historical trades", symbol)
     log.info("[historical] %s   target_candle_timeframe = %ds", symbol, cfg.candle_interval_sec)
@@ -171,40 +172,77 @@ async def download_trades(symbol, cfg):
         if cfg.max_history_requests_per_refresh and requests >= cfg.max_history_requests_per_refresh:
             log.warning("[historical] %s DOWNLOAD STOPPED: reached max requests (%d)", symbol, requests)
             break
+
+        params = {"instId": symbol, "limit": "100"}
+        if before is not None:
+            params["before"] = str(before)
+
+        # Log request details (without secrets)
+        log.info("[historical] %s API REQUEST", symbol)
+        log.info("[historical] %s   endpoint = %s", symbol, HISTORY_PATH)
+        log.info("[historical] %s   instId = %s", symbol, symbol)
+        log.info("[historical] %s   limit = 100", symbol)
+        if before is not None:
+            log.info("[historical] %s   before = %s", symbol, before)
+
         try:
-            batch = await asyncio.to_thread(
+            response = await asyncio.to_thread(
                 okx_get,
                 HISTORY_PATH,
-                {"instId": symbol, "limit": "100", "before": cursor},
+                params,
                 cfg.request_timeout_sec
             )
         except Exception as e:
-            log.error("[historical] %s DOWNLOAD ERROR: request #%d failed: %s", symbol, requests+1, e)
+            log.error("[historical] %s API REQUEST FAILED: %s", symbol, e)
             break
+
         requests += 1
+        http_status = 200  # urllib raises on non-200
+        code = response.get("code")
+        msg = response.get("msg")
+        data = response.get("data", [])
 
-        if not batch:
-            log.debug("[historical] %s DOWNLOAD: request #%d returned empty batch", symbol, requests)
+        log.info("[historical] %s API RESPONSE", symbol)
+        log.info("[historical] %s   http_status = %d", symbol, http_status)
+        log.info("[historical] %s   okx_code = %s", symbol, code)
+        log.info("[historical] %s   okx_msg = %s", symbol, msg)
+        log.info("[historical] %s   data_count = %d", symbol, len(data))
+
+        if code != "0":
+            log.error("[historical] %s API ERROR: code=%s msg=%s", symbol, code, msg)
             break
 
+        if not data:
+            log.warning("[historical] %s DOWNLOAD EMPTY: OKX returned zero historical rows", symbol)
+            break
+
+        # Parse trades
         parsed = []
-        for z in batch:
+        for z in data:
             ts = timestamp(z.get("ts"))
             px = f(z.get("px"))
             qty = f(z.get("sz"))
             side = side_of(z)
+            trade_id = str(z.get("tradeId") or "")
             if ts is not None and px > 0 and qty > 0 and side:
                 parsed.append({
                     "ts": ts,
                     "price": px,
                     "qty": qty,
                     "side": side,
-                    "tradeId": str(z.get("tradeId") or "")
+                    "tradeId": trade_id
                 })
         if not parsed:
+            log.warning("[historical] %s no parseable trades in batch", symbol)
             break
+
+        # Filter to the requested time range
         rows.extend(t for t in parsed if start <= t["ts"] <= end)
-        oldest = min(t["ts"] for t in parsed)
+
+        # Get the oldest trade in this batch to set 'before' for next request
+        # The API returns trades sorted by tradeId descending, so the last element is the oldest.
+        oldest_trade = parsed[-1]
+        before = oldest_trade["tradeId"]   # use tradeId for pagination
 
         # Progress every 10 requests
         if requests % 10 == 0:
@@ -218,19 +256,15 @@ async def download_trades(symbol, cfg):
                          datetime.fromtimestamp(oldest_ts).isoformat(),
                          datetime.fromtimestamp(newest_ts).isoformat(),
                          coverage)
-            else:
-                log.info("[historical] %s DOWNLOAD PROGRESS: requests=%d, trades so far=%d", symbol, requests, len(rows))
 
         # Check if we have reached the start boundary
-        if oldest <= start:
+        if oldest_trade["ts"] <= start:
             break
-        nxt = str(int(oldest * 1000) - 1)
-        if nxt == cursor:
-            break
-        cursor = nxt
+
+        # Small delay between requests
         await asyncio.sleep(max(0, cfg.request_delay_sec))
 
-    # Deduplicate
+    # Deduplicate (just in case)
     seen = set()
     out = []
     for t in sorted(rows, key=lambda x: (x["ts"], x["tradeId"])):
@@ -269,7 +303,6 @@ def build_candles_from_trades(trades, interval_sec=300):
     for t in trades_sorted:
         ts = t["ts"]
         if ts >= bucket_end:
-            # finalize bucket
             if bucket_open is not None and bucket_close is not None:
                 candles.append(Candle(
                     ts=current_bucket_start,
@@ -279,7 +312,6 @@ def build_candles_from_trades(trades, interval_sec=300):
                     close=bucket_close,
                     volume=bucket_volume
                 ))
-            # advance to next bucket(s)
             while ts >= bucket_end:
                 current_bucket_start += interval_sec
                 bucket_end += interval_sec
@@ -295,7 +327,6 @@ def build_candles_from_trades(trades, interval_sec=300):
             bucket_volume += t["qty"]
             if bucket_open is None:
                 bucket_open = t["price"]
-    # final bucket
     if bucket_open is not None and bucket_close is not None:
         candles.append(Candle(
             ts=current_bucket_start,
@@ -309,7 +340,6 @@ def build_candles_from_trades(trades, interval_sec=300):
 
 
 def compute_atr(candles, period=14):
-    """Compute ATR (high-low range) over the last `period` candles."""
     if len(candles) < period:
         return None
     ranges = [c.high - c.low for c in candles[-period:]]
@@ -317,7 +347,6 @@ def compute_atr(candles, period=14):
 
 
 def candle_significant(candle, atr, cfg):
-    """Check if a candle meets the minimum size requirements."""
     if atr is None or atr <= 0:
         return False
     candle_range = candle.high - candle.low
@@ -327,11 +356,6 @@ def candle_significant(candle, atr, cfg):
 
 
 def pattern_features(candles):
-    """
-    Extract feature vector for a 3-candle pattern.
-    Features: normalized OHLC of each candle relative to first candle's open.
-    Returns list of 12 floats (3 candles * 4 OHLC).
-    """
     if len(candles) != 3:
         raise ValueError("Pattern must have exactly 3 candles")
     base = candles[0].open
@@ -344,10 +368,6 @@ def pattern_features(candles):
 
 
 def pattern_similarity(vec1, vec2):
-    """
-    Compute similarity (0..1) between two feature vectors using inverse
-    of Euclidean distance.
-    """
     if len(vec1) != len(vec2):
         return 0.0
     diff_sq = sum((a - b) ** 2 for a, b in zip(vec1, vec2))
@@ -357,36 +377,20 @@ def pattern_similarity(vec1, vec2):
 
 
 def classify_forward_trend(candles, start_idx, cfg):
-    """
-    Analyze candles after the pattern (from start_idx+3 onward) to determine
-    if a meaningful, sustained trend exists.
-    Returns 'bullish', 'bearish', or 'neutral'.
-
-    Conditions:
-      - At least cfg.min_forward_trend_candles candles exist after the pattern.
-      - Net percentage change over that period exceeds cfg.min_forward_move_pct
-        in either direction.
-      - At least cfg.min_forward_directional_ratio of the forward candles are
-        in the direction of the net move (i.e., candle close > open for bullish,
-        close < open for bearish).
-    """
     total_candles = len(candles)
     pattern_end = start_idx + cfg.pattern_length
     if pattern_end + cfg.min_forward_trend_candles > total_candles:
         return "neutral"
 
-    # Use exactly min_forward_trend_candles candles after the pattern
     forward_candles = candles[pattern_end:pattern_end + cfg.min_forward_trend_candles]
     start_price = candles[pattern_end - 1].close
     end_price = forward_candles[-1].close
     net_move_pct = (end_price - start_price) / start_price if start_price else 0.0
 
-    # Determine direction based on net move
     if abs(net_move_pct) < cfg.min_forward_move_pct:
-        return "neutral"   # too small
+        return "neutral"
 
-    # Count directional candles
-    direction = 1 if net_move_pct > 0 else -1  # +1 bullish, -1 bearish
+    direction = 1 if net_move_pct > 0 else -1
     dir_count = 0
     for c in forward_candles:
         move = c.close - c.open
@@ -395,13 +399,13 @@ def classify_forward_trend(candles, start_idx, cfg):
     ratio = dir_count / len(forward_candles)
 
     if ratio < cfg.min_forward_directional_ratio:
-        return "neutral"   # insufficient persistence
+        return "neutral"
 
     return "bullish" if direction > 0 else "bearish"
 
 
 # ---------------------------------------------------------------------
-# Dataset: stores historical candles and precomputed pattern features
+# Dataset
 # ---------------------------------------------------------------------
 
 class Dataset:
@@ -409,11 +413,10 @@ class Dataset:
         self.candles = candles
         self.cfg = cfg
         self.atr = compute_atr(candles, cfg.atr_period)
-        self.patterns = []   # list of (start_idx, feature_vector)
+        self.patterns = []
         self._build_patterns()
 
     def _build_patterns(self):
-        """Precompute feature vectors for all valid 3-candle patterns."""
         n = len(self.candles)
         if n < self.cfg.pattern_length + self.cfg.min_forward_trend_candles:
             return
@@ -427,7 +430,6 @@ class Dataset:
             self.patterns.append((i, vec))
 
     def find_matches(self, current_pattern_candles: List[Candle]) -> List[Tuple[int, float]]:
-        """Return list of (start_idx, similarity) for matches above threshold."""
         if self.atr is None:
             return []
         if not all(candle_significant(c, self.atr, self.cfg) for c in current_pattern_candles):
@@ -442,7 +444,6 @@ class Dataset:
         return matches
 
     def classify_forward(self, start_idx: int) -> str:
-        """Classify the forward trend after the pattern at start_idx."""
         return classify_forward_trend(self.candles, start_idx, self.cfg)
 
 
@@ -462,6 +463,8 @@ class HistoricalEngine(StrategyEngine):
         self._datasets = {}
         self._ready = {}
         self._tasks = {}
+        self._last_attempt = {}   # symbol -> last preparation start time
+        self._last_failure = {}   # symbol -> last failure timestamp
         self._last_signal = {}
         self._lock = asyncio.Lock()
 
@@ -479,8 +482,22 @@ class HistoricalEngine(StrategyEngine):
             for s in list(self._candidates):
                 if s not in symbols:
                     self._candidates.pop(s, None)
+
+        now = time.time()
         for s in symbols:
+            # Check if we should start a preparation task
+            should_start = False
             if s not in self._tasks or self._tasks[s].done():
+                # Check if we have a recent failure cooldown
+                last_fail = self._last_failure.get(s, 0)
+                if now - last_fail < self.config.retry_cooldown_sec:
+                    log.info("[historical] %s preparation skipped (cooldown, %.1fs remaining)", s,
+                             self.config.retry_cooldown_sec - (now - last_fail))
+                    continue
+                should_start = True
+
+            if should_start:
+                self._last_attempt[s] = now
                 self._tasks[s] = asyncio.create_task(self._prepare(s))
                 log.info("[historical] %s preparation task CREATED", s)
 
@@ -498,13 +515,11 @@ class HistoricalEngine(StrategyEngine):
 
         # --- Cache check ---
         log.info("[historical] %s checking cache...", symbol)
-        cache_hit = False
         try:
             if os.path.exists(cache_path):
                 mtime = os.path.getmtime(cache_path)
                 age_hours = (time.time() - mtime) / 3600
                 if age_hours <= cfg.history_refresh_hours:
-                    # Try loading
                     candles = self._load_candles(cache_path)
                     if candles:
                         ds = Dataset(candles, cfg)
@@ -530,11 +545,13 @@ class HistoricalEngine(StrategyEngine):
         except Exception as e:
             log.error("[historical] %s PREPARATION FAILED: download_trades() raised exception", symbol, exc_info=True)
             self._ready[symbol] = False
+            self._last_failure[symbol] = time.time()
             return
 
         if not trades:
             log.error("[historical] %s DOWNLOAD FAILED: no historical trades returned", symbol)
             self._ready[symbol] = False
+            self._last_failure[symbol] = time.time()
             return
 
         # --- Validate coverage ---
@@ -547,6 +564,7 @@ class HistoricalEngine(StrategyEngine):
             log.error("[historical] %s PREPARATION FAILED: insufficient coverage (%.1fd < %.1fd)",
                       symbol, coverage_days, cfg.history_days * 0.9)
             self._ready[symbol] = False
+            self._last_failure[symbol] = time.time()
             return
 
         # --- Build candles ---
@@ -559,6 +577,7 @@ class HistoricalEngine(StrategyEngine):
             log.error("[historical] %s PREPARATION FAILED: insufficient candles (need %d, got %d)",
                       symbol, required_candles, len(candles))
             self._ready[symbol] = False
+            self._last_failure[symbol] = time.time()
             return
 
         # --- Save cache ---
@@ -574,6 +593,7 @@ class HistoricalEngine(StrategyEngine):
         # --- Final READY ---
         log.info("[historical] %s READY timeframe=%ds pattern_length=%d candles=%d coverage=%.1fd",
                  symbol, cfg.candle_interval_sec, cfg.pattern_length, len(candles), coverage_days)
+        self._last_failure.pop(symbol, None)  # clear failure flag
 
     def _save_candles(self, path, candles):
         tmp = path + ".tmp"
@@ -608,9 +628,7 @@ class HistoricalEngine(StrategyEngine):
         return candles
 
     async def _get_current_pattern(self, symbol):
-        """Fetch the latest 3 completed 5-minute candles using candle_fetcher."""
         if self._candle_fetcher is None:
-            # fallback: build from trade store (less accurate)
             trades = await self._trade_store.get_window(symbol, self.config.live_window_ms)
             if len(trades) < 20:
                 return None
@@ -619,14 +637,12 @@ class HistoricalEngine(StrategyEngine):
                 return None
             return live_candles[-3:]
         try:
-            # Fetch 5 candles to ensure we get 3 completed ones (5-minute)
             raw = await self._candle_fetcher(symbol, "5m", 5)
         except Exception as e:
             log.warning("[historical] %s cannot fetch candles: %s", symbol, e)
             return None
         if not raw:
             return None
-        # Take last 3 completed (confirm=1)
         completed = [c for c in raw if str(c.get("confirm", "1")) == "1"]
         if len(completed) < 3:
             return None
@@ -703,7 +719,6 @@ class HistoricalEngine(StrategyEngine):
         log.info("[historical] %s analyzing forward outcomes (min_forward=%d, dir_ratio=%.0f%%)",
                  symbol, cfg.min_forward_trend_candles, cfg.min_forward_directional_ratio * 100)
 
-        # Classify forward trends for each match
         bullish = 0
         bearish = 0
         neutral = 0
