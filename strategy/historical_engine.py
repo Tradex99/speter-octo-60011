@@ -28,6 +28,8 @@ log = logging.getLogger("okx_futures.historical")
 BASE = "https://www.okx.com"
 HISTORY_CANDLES_PATH = "/api/v5/market/history-candles"
 
+REQUIRED_TRADE_WINDOW_MS = 900_000
+
 # Maps candle_interval_sec -> OKX 'bar' query param value.
 _BAR_BY_INTERVAL_SEC = {
     60: "1m", 180: "3m", 300: "5m", 900: "15m", 1800: "30m",
