@@ -173,20 +173,30 @@ def zone_being_tested(zones: List[Zone], price: float, tolerance_pct: float) -> 
     return best
 
 
-def next_opposing_resistance(zones: List[Zone], entry_price: float) -> Optional[Zone]:
+def next_opposing_resistance(zones: List[Zone], entry_price: float, min_distance_pct: float = 0.0) -> Optional[Zone]:
     """The FIRST meaningful resistance above the actual entry: closest
-    zone whose LOW is strictly above entry_price. A zone whose low sits
-    at or below entry overlaps (or is on the wrong side of) the entry
-    and is never eligible, no matter how "near" it is in the full zone
-    list."""
-    candidates = [z for z in zones if z.low > entry_price]
+    zone whose LOW is strictly above entry_price AND at least
+    min_distance_pct away from entry. A zone whose low sits at or below
+    entry overlaps (or is on the wrong side of) the entry and is never
+    eligible, no matter how "near" it is in the full zone list. The
+    distance floor exists so a minor zone sitting right on top of entry
+    doesn't get picked over a real level further out — it's skipped,
+    not treated as "no opposing zone"."""
+    candidates = [
+        z for z in zones
+        if z.low > entry_price and (z.low - entry_price) / entry_price >= min_distance_pct
+    ]
     return min(candidates, key=lambda z: z.low) if candidates else None
 
 
-def next_opposing_support(zones: List[Zone], entry_price: float) -> Optional[Zone]:
+def next_opposing_support(zones: List[Zone], entry_price: float, min_distance_pct: float = 0.0) -> Optional[Zone]:
     """Mirror of next_opposing_resistance for SHORTs: closest zone whose
-    HIGH is strictly below entry_price."""
-    candidates = [z for z in zones if z.high < entry_price]
+    HIGH is strictly below entry_price AND at least min_distance_pct
+    away from entry."""
+    candidates = [
+        z for z in zones
+        if z.high < entry_price and (entry_price - z.high) / entry_price >= min_distance_pct
+    ]
     return max(candidates, key=lambda z: z.high) if candidates else None
 
 
@@ -276,9 +286,16 @@ class SupportResistanceConfig:
     lookback_hours: float = 5.0
     candle_fetch_buffer: int = 5
 
-    swing_fractal_width: int = 2
+    swing_fractal_width: int = 6
     zone_tolerance_pct: float = 0.0015
-    minimum_level_touches: int = 2
+    minimum_level_touches: int = 3
+    # Opposing zone must sit at least this far from entry (as a % of
+    # entry) to count as the trade target. Without this, a zone that's
+    # technically "opposing" but only a few ticks away (formed from
+    # very recent, minor swings) blocks nearly every setup even when a
+    # real level is available further out -- this makes the strategy
+    # skip past it instead of rejecting the trade outright.
+    minimum_opposing_zone_distance_pct: float = 0.002
     # Only exactly 1 is implemented today (see module docstring) -- kept
     # as a config field per spec rather than hardcoded, for whenever a
     # multi-candle confirmation variant gets built.
@@ -455,7 +472,11 @@ class SupportResistanceEngine(StrategyEngine):
             state.last_reject_reason = "cooldown"
             return None
 
-        opposing = next_opposing_resistance(opposing_zones, price) if direction == "long" else next_opposing_support(opposing_zones, price)
+        opposing = (
+            next_opposing_resistance(opposing_zones, price, cfg.minimum_opposing_zone_distance_pct)
+            if direction == "long"
+            else next_opposing_support(opposing_zones, price, cfg.minimum_opposing_zone_distance_pct)
+        )
         if opposing is None:
             state.last_reject_reason = "no_next_resistance" if direction == "long" else "no_next_support"
             return None
